@@ -1,8 +1,30 @@
+# ================================
+# 🚀 AIDA Drive Connector - RAG 2.2
+# API multilíngue com busca semântica e detecção de nomes automáticos
+# ================================
+
+# 🔹 Core da API
 fastapi
 uvicorn
+
+# 🔹 Google Drive API
 google-auth
 google-auth-oauthlib
 google-auth-httplib2
 google-api-python-client
+
+# 🔹 Leitura e parsing de documentos
 docx2txt
 PyPDF2
+
+# 🔹 NLP para detecção de nomes e idiomas
+spacy
+nameparser
+
+# 🔹 Modelos de linguagem do spaCy (EN/PT)
+# Você precisa baixar manualmente após instalar:
+# python -m spacy download en_core_web_sm
+# python -m spacy download pt_core_news_sm
+
+# 🔹 Utilitários
+regex
