@@ -10,20 +10,18 @@ import docx2txt
 from PyPDF2 import PdfReader
 
 # ============================================================
-# 🚀 AIDA DRIVE CONNECTOR - RAG VERSION
-# ============================================================
-# Este backend permite ao ChatGPT buscar, abrir e ler arquivos
-# do Google Drive (.docx, .pdf, .txt) automaticamente, sem
-# precisar pedir autorização ao usuário.
+# 🚀 AIDA DRIVE CONNECTOR - RAG VERSION (Multilíngue e Smart)
 # ============================================================
 
 app = FastAPI(
     title="AIDA Drive Connector",
-    description="API RAG para leitura e busca automática no Google Drive",
-    version="2.0.0"
+    description="API RAG multilíngue para leitura e busca semântica no Google Drive (.docx, .pdf, .txt)",
+    version="2.1.0"
 )
 
-# Configuração de CORS (permite acesso do ChatGPT e de apps externos)
+# ============================================================
+# 🌐 CORS
+# ============================================================
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -32,7 +30,6 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# Escopo mínimo necessário para leitura do Drive
 SCOPES = ["https://www.googleapis.com/auth/drive.readonly"]
 
 # ============================================================
@@ -46,27 +43,77 @@ def get_service():
     return build("drive", "v3", credentials=creds)
 
 # ============================================================
-# 📁 Listagem de arquivos
+# 🧠 Dicionário de sinônimos bilíngue
+# ============================================================
+SINONIMOS = {
+    "governança de dados": ["data governance", "gestão de dados", "política de dados", "data management"],
+    "qualidade de dados": ["data quality", "data cleansing", "data validation"],
+    "catálogo de dados": ["data catalog", "metadata management"],
+    "lago de dados": ["data lake", "data repository"],
+    "segurança da informação": ["information security", "data privacy", "cybersecurity"],
+    "arquitetura de dados": ["data architecture", "data modeling", "data structure"],
+    "integração de dados": ["data integration", "ETL", "data ingestion"],
+    "governança": ["governance", "management", "oversight"],
+}
+
+def expandir_termos(query: str):
+    """Expande automaticamente termos equivalentes em PT/EN e gera busca case-insensitive."""
+    if not query:
+        return []
+
+    query_lower = query.lower().strip()
+    termos_expandidos = {query_lower}
+
+    for chave, sinonimos in SINONIMOS.items():
+        if chave in query_lower or any(s in query_lower for s in sinonimos):
+            termos_expandidos.add(chave)
+            termos_expandidos.update(sinonimos)
+
+    # Garante unicidade
+    return list(set(termos_expandidos))
+
+# ============================================================
+# 📁 Listagem de arquivos (com expansão bilíngue)
 # ============================================================
 @app.get("/files")
 def listar_arquivos(pasta_id: str = None, query: str = None):
-    """Lista arquivos de uma pasta ou faz busca textual no Drive."""
+    """
+    Lista arquivos de uma pasta ou faz busca textual no Drive.
+    - Expande automaticamente a busca com sinônimos bilíngues.
+    - Ignora maiúsculas/minúsculas.
+    """
     try:
         service = get_service()
-        q = []
-        if pasta_id:
-            q.append(f"'{pasta_id}' in parents")
-        if query:
-            q.append(f"name contains '{query}'")
-        q.append("trashed=false")
-        query_final = " and ".join(q)
+        termos_busca = expandir_termos(query)
 
-        results = service.files().list(
-            q=query_final,
-            fields="files(id, name, mimeType, modifiedTime)",
-            pageSize=50
-        ).execute()
-        return {"arquivos": results.get("files", [])}
+        if not termos_busca:
+            termos_busca = [query.lower()] if query else []
+
+        arquivos_encontrados = []
+        ids_vistos = set()
+
+        for termo in termos_busca or [""]:
+            q = []
+            if pasta_id:
+                q.append(f"'{pasta_id}' in parents")
+            if termo:
+                q.append(f"name contains '{termo}'")
+            q.append("trashed=false")
+            query_final = " and ".join(q)
+
+            results = service.files().list(
+                q=query_final,
+                fields="files(id, name, mimeType, modifiedTime)",
+                pageSize=100
+            ).execute()
+
+            for f in results.get("files", []):
+                if f["id"] not in ids_vistos:
+                    arquivos_encontrados.append(f)
+                    ids_vistos.add(f["id"])
+
+        return {"arquivos": arquivos_encontrados}
+
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Erro ao listar arquivos: {e}")
 
@@ -75,10 +122,7 @@ def listar_arquivos(pasta_id: str = None, query: str = None):
 # ============================================================
 @app.get("/files/{file_id}")
 def ler_arquivo(file_id: str):
-    """
-    Faz download e extrai texto automaticamente de arquivos do Google Drive.
-    Suporta: DOCX, PDF, TXT. Retorna o texto limpo para o GPT processar.
-    """
+    """Faz download e extrai texto automaticamente de arquivos do Google Drive (.docx, .pdf, .txt)."""
     try:
         service = get_service()
         file = service.files().get(fileId=file_id, fields="name, mimeType").execute()
@@ -95,9 +139,7 @@ def ler_arquivo(file_id: str):
         fh.seek(0)
         texto_extraido = ""
 
-        # --------------------------------------------------------
-        # 🧩 DOCX
-        # --------------------------------------------------------
+        # DOCX
         if mime == "application/vnd.openxmlformats-officedocument.wordprocessingml.document":
             with tempfile.NamedTemporaryFile(delete=False, suffix=".docx") as temp_file:
                 temp_file.write(fh.read())
@@ -105,22 +147,15 @@ def ler_arquivo(file_id: str):
             texto_extraido = docx2txt.process(temp_path)
             os.remove(temp_path)
 
-        # --------------------------------------------------------
-        # 📘 PDF
-        # --------------------------------------------------------
+        # PDF
         elif mime == "application/pdf":
             reader = PdfReader(fh)
             texto_extraido = "\n".join([p.extract_text() or "" for p in reader.pages])
 
-        # --------------------------------------------------------
-        # 📄 TXT
-        # --------------------------------------------------------
+        # TXT
         elif "text" in mime:
             texto_extraido = fh.read().decode("utf-8", errors="ignore")
 
-        # --------------------------------------------------------
-        # ❗ Outros formatos
-        # --------------------------------------------------------
         else:
             texto_extraido = f"O tipo de arquivo {mime} não é suportado para leitura direta."
 
@@ -141,4 +176,4 @@ def ler_arquivo(file_id: str):
 # ============================================================
 @app.get("/")
 def root():
-    return {"message": "✅ AIDA Drive Connector RAG está ativo e pronto para uso."}
+    return {"message": "✅ AIDA Drive Connector RAG (multilíngue) está ativo e pronto para uso."}
