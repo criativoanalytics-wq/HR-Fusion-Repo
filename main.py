@@ -177,3 +177,10 @@ def ler_arquivo(file_id: str):
 @app.get("/")
 def root():
     return {"message": "✅ AIDA Drive Connector RAG (multilíngue) está ativo e pronto para uso."}
+
+if __name__ == "__main__":
+    import uvicorn
+    import os
+
+    port = int(os.getenv("PORT", 8080))  # 👈 Render injeta a variável PORT
+    uvicorn.run("main:app", host="0.0.0.0", port=port, reload=False)
