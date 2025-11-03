@@ -75,6 +75,49 @@ def expandir_termos(query: str):
 # ============================================================
 # 📁 Listagem de arquivos (com expansão bilíngue)
 # ============================================================
+@app.get("/files")
+def listar_arquivos(pasta_id: str = None, query: str = None):
+    """
+    Lista arquivos de uma pasta ou faz busca textual no Drive.
+    - Expande automaticamente a busca com sinônimos bilíngues.
+    - Ignora maiúsculas/minúsculas.
+    """
+    try:
+        service = get_service()
+        termos_busca = expandir_termos(query)
+
+        if not termos_busca:
+            termos_busca = [query.lower()] if query else []
+
+        arquivos_encontrados = []
+        ids_vistos = set()
+
+        for termo in termos_busca or [""]:
+            q = []
+            if pasta_id:
+                q.append(f"'{pasta_id}' in parents")
+            if termo:
+                q.append(f"name contains '{termo}'")
+            q.append("trashed=false")
+            query_final = " and ".join(q)
+
+            results = service.files().list(
+                q=query_final,
+                fields="files(id, name, mimeType, modifiedTime)",
+                pageSize=100
+            ).execute()
+
+            for f in results.get("files", []):
+                if f["id"] not in ids_vistos:
+                    arquivos_encontrados.append(f)
+                    ids_vistos.add(f["id"])
+
+        return {"arquivos": arquivos_encontrados}
+
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Erro ao listar arquivos: {e}")
+
+
 @app.get("/smart_search")
 def smart_search(query: str):
     """
@@ -122,7 +165,6 @@ def smart_search(query: str):
 
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Erro na busca expandida: {e}")
-
 
 # ============================================================
 # 📄 Leitura e extração de conteúdo
