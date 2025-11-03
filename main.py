@@ -75,47 +75,54 @@ def expandir_termos(query: str):
 # ============================================================
 # 📁 Listagem de arquivos (com expansão bilíngue)
 # ============================================================
-@app.get("/files")
-def listar_arquivos(pasta_id: str = None, query: str = None):
+@app.get("/smart_search")
+def smart_search(query: str):
     """
-    Lista arquivos de uma pasta ou faz busca textual no Drive.
-    - Expande automaticamente a busca com sinônimos bilíngues.
-    - Ignora maiúsculas/minúsculas.
+    Realiza uma busca expandida:
+    - Pesquisa por nome no Drive
+    - Lê o conteúdo de cada arquivo retornado
+    - Faz correspondência com sinônimos e conteúdo interno
     """
     try:
         service = get_service()
-        termos_busca = expandir_termos(query)
+        termos = expandir_termos(query)
+        if not termos:
+            termos = [query.lower()]
 
-        if not termos_busca:
-            termos_busca = [query.lower()] if query else []
-
-        arquivos_encontrados = []
+        arquivos_final = []
         ids_vistos = set()
 
-        for termo in termos_busca or [""]:
-            q = []
-            if pasta_id:
-                q.append(f"'{pasta_id}' in parents")
-            if termo:
-                q.append(f"name contains '{termo}'")
-            q.append("trashed=false")
-            query_final = " and ".join(q)
-
+        for termo in termos:
+            q = f"name contains '{termo}' and trashed=false"
             results = service.files().list(
-                q=query_final,
+                q=q,
                 fields="files(id, name, mimeType, modifiedTime)",
-                pageSize=100
+                pageSize=50
             ).execute()
 
             for f in results.get("files", []):
                 if f["id"] not in ids_vistos:
-                    arquivos_encontrados.append(f)
                     ids_vistos.add(f["id"])
 
-        return {"arquivos": arquivos_encontrados}
+                    # Agora tenta achar também dentro do conteúdo
+                    try:
+                        conteudo = ler_arquivo(f["id"])["conteudo"].lower()
+                        if any(t in conteudo for t in termos):
+                            arquivos_final.append(f)
+                    except Exception as err:
+                        print(f"⚠️ Erro ao ler {f['name']}: {err}")
+                        continue
+
+        return {
+            "query_original": query,
+            "termos_expandidos": termos,
+            "arquivos_encontrados": arquivos_final,
+            "total": len(arquivos_final)
+        }
 
     except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Erro ao listar arquivos: {e}")
+        raise HTTPException(status_code=500, detail=f"Erro na busca expandida: {e}")
+
 
 # ============================================================
 # 📄 Leitura e extração de conteúdo
