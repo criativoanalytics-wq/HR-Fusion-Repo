@@ -8,6 +8,8 @@ import os
 import tempfile
 import docx2txt
 from PyPDF2 import PdfReader
+import re
+import spacy
 
 # ============================================================
 # 🚀 AIDA DRIVE CONNECTOR - RAG VERSION (Multilíngue e Smart)
@@ -31,6 +33,9 @@ app.add_middleware(
 )
 
 SCOPES = ["https://www.googleapis.com/auth/drive.readonly"]
+# Carrega modelos multilíngues
+nlp_en = spacy.load("en_core_web_sm")
+nlp_pt = spacy.load("pt_core_news_sm")
 
 # ============================================================
 # 🔐 Autenticação
@@ -55,6 +60,22 @@ SINONIMOS = {
     "integração de dados": ["data integration", "ETL", "data ingestion"],
     "governança": ["governance", "management", "oversight"],
 }
+# Detecta nomes próprios comuns nos documentos
+#NOMES_PESSOAS = ["lisa", "rick", "felipe", "sanders", "gavin", "jennifer"]
+def detectar_pessoa_spacy(texto: str):
+    """Detecta automaticamente nomes de pessoas em PT/EN usando spaCy."""
+    if not texto:
+        return []
+    pessoas = set()
+
+    # Análise em ambos os idiomas
+    for nlp in [nlp_en, nlp_pt]:
+        doc = nlp(texto)
+        for ent in doc.ents:
+            if ent.label_ == "PERSON":
+                pessoas.add(ent.text.strip())
+
+    return list(pessoas)
 
 def expandir_termos(query: str):
     """Expande automaticamente termos equivalentes em PT/EN e gera busca case-insensitive."""
@@ -122,42 +143,56 @@ def listar_arquivos(pasta_id: str = None, query: str = None):
 def smart_search(query: str):
     """
     Realiza uma busca expandida:
-    - Pesquisa por nome no Drive
-    - Lê o conteúdo de cada arquivo retornado
-    - Faz correspondência com sinônimos e conteúdo interno
+    - Foco inicial em arquivos relacionados a uma pessoa específica (se aplicável)
+    - Expansão semântica multilíngue caso nenhum resultado direto seja encontrado
     """
     try:
         service = get_service()
         termos = expandir_termos(query)
-        if not termos:
-            termos = [query.lower()]
-
+        pessoas = detectar_pessoa_spacy(query)
+        pessoa = pessoas[0].lower() if pessoas else None
         arquivos_final = []
         ids_vistos = set()
 
-        for termo in termos:
-            q = f"name contains '{termo}' and trashed=false"
-            results = service.files().list(
-                q=q,
-                fields="files(id, name, mimeType, modifiedTime)",
-                pageSize=50
-            ).execute()
+        def buscar(termos_busca, foco_pessoa=False):
+            encontrados = []
+            for termo in termos_busca:
+                q = f"name contains '{termo}' and trashed=false"
+                results = service.files().list(
+                    q=q,
+                    fields="files(id, name, mimeType, modifiedTime)",
+                    pageSize=100
+                ).execute()
+                for f in results.get("files", []):
+                    if f["id"] not in ids_vistos:
+                        try:
+                            conteudo = ler_arquivo(f["id"])["conteudo"].lower()
+                            # 🔍 filtro por pessoa, se houver
+                            if foco_pessoa and pessoa not in f["name"].lower() and pessoa not in conteudo:
+                                continue
+                            # 🔍 busca textual
+                            if any(t in conteudo for t in termos_busca):
+                                encontrados.append(f)
+                                ids_vistos.add(f["id"])
+                        except Exception as err:
+                            print(f"Erro ao ler {f['name']}: {err}")
+                            continue
+            return encontrados
 
-            for f in results.get("files", []):
-                if f["id"] not in ids_vistos:
-                    ids_vistos.add(f["id"])
+        # 🔹 Nível 1: busca restrita à pessoa
+        if pessoa:
+            arquivos_final = buscar(termos, foco_pessoa=True)
 
-                    # Agora tenta achar também dentro do conteúdo
-                    try:
-                        conteudo = ler_arquivo(f["id"])["conteudo"].lower()
-                        if any(t in conteudo for t in termos):
-                            arquivos_final.append(f)
-                    except Exception as err:
-                        print(f"⚠️ Erro ao ler {f['name']}: {err}")
-                        continue
+        # 🔹 Nível 2: expansão se nada for encontrado
+        expanded = False
+        if not arquivos_final:
+            arquivos_final = buscar(termos, foco_pessoa=False)
+            expanded = True if pessoa else False
 
         return {
             "query_original": query,
+            "pessoa_detectada": pessoa,
+            "busca_expandida": expanded,
             "termos_expandidos": termos,
             "arquivos_encontrados": arquivos_final,
             "total": len(arquivos_final)
