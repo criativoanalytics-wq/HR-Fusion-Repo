@@ -16,6 +16,7 @@ google-api-python-client
 # 🔹 Leitura e parsing de documentos
 docx2txt
 PyPDF2
+python-pptx
 
 # 🔹 NLP para detecção de nomes e idiomas
 spacy
@@ -28,3 +29,4 @@ nameparser
 
 # 🔹 Utilitários
 regex
+
