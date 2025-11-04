@@ -261,7 +261,7 @@ def ler_arquivo(file_id: str):
             texto_extraido = fh.read().decode("utf-8", errors="ignore")
 
         # --------------------------------------------------------
-        # 🖼️ PPTX (PowerPoint) — leitura hierárquica com posição e estrutura
+        # 🖼️ PPTX (PowerPoint) — leitura hierárquica e agrupamento por faixas visuais
         # --------------------------------------------------------
         elif mime in [
             "application/vnd.openxmlformats-officedocument.presentationml.presentation",
@@ -278,6 +278,7 @@ def ler_arquivo(file_id: str):
 
             def extrair_texto_recursivo(shape, elementos):
                 """Extrai texto e posição de shapes, incluindo grupos e tabelas."""
+                # 🔹 Texto simples
                 if hasattr(shape, "text") and shape.text.strip():
                     elementos.append({
                         "texto": shape.text.strip(),
@@ -286,11 +287,13 @@ def ler_arquivo(file_id: str):
                         "largura": int(getattr(shape, "width", 0)),
                         "altura": int(getattr(shape, "height", 0)),
                     })
-                # Percorre subshapes (grupos)
+
+                # 🔹 Subshapes (grupos)
                 if hasattr(shape, "shapes"):
                     for subshape in shape.shapes:
                         extrair_texto_recursivo(subshape, elementos)
-                # Lê tabelas como texto concatenado
+
+                # 🔹 Tabelas
                 if hasattr(shape, "has_table") and shape.has_table:
                     table = shape.table
                     for row in table.rows:
@@ -304,15 +307,20 @@ def ler_arquivo(file_id: str):
                                 "altura": int(getattr(shape, "height", 0)),
                             })
 
+            # ========================================================
+            # 🔹 Loop principal dos slides
+            # ========================================================
             for i, slide in enumerate(prs.slides, start=1):
                 elementos = []
 
+                # Extrai shapes e tabelas
                 for shape in slide.shapes:
                     extrair_texto_recursivo(shape, elementos)
 
-                # Agrupa por "linha visual" (faixas horizontais)
+                # Ordena por posição (topo → baixo, esquerda → direita)
                 elementos_ordenados = sorted(elementos, key=lambda e: (e["y"], e["x"]))
 
+                # Agrupa por faixa horizontal
                 linha_id = 0
                 ultima_y = None
                 for el in elementos_ordenados:
@@ -321,53 +329,68 @@ def ler_arquivo(file_id: str):
                         ultima_y = el["y"]
                     el["linha_visual"] = linha_id
 
-                # Coleta notas do apresentador (se houver)
+                # Coleta notas do apresentador
                 notas = None
                 if slide.has_notes_slide and slide.notes_slide.notes_text_frame:
                     notas = slide.notes_slide.notes_text_frame.text.strip()
 
-                # Captura possível título
+                # Captura título do slide
                 titulo_slide = next((e["texto"] for e in elementos_ordenados if e["linha_visual"] == 1), f"Slide {i}")
+
+                # Agrupa conteúdo por faixa visual
+                faixas = {}
+                for e in elementos_ordenados:
+                    faixa_id = e["linha_visual"]
+                    faixas.setdefault(faixa_id, []).append(e["texto"])
+
+                faixas_agrupadas = [
+                    {"linha_visual": k, "conteudo": " ".join(v)} for k, v in faixas.items()
+                ]
 
                 slides_estruturados.append({
                     "slide_numero": i,
                     "titulo": titulo_slide,
                     "elementos": elementos_ordenados,
-                    "notas": notas
+                    "faixas": faixas_agrupadas,
+                    "notas": notas or ""
                 })
 
-            # 🔄 Monta o conteúdo final
+            # ========================================================
+            # 🔹 Monta o texto legível consolidado
+            # ========================================================
             texto_extraido = ""
             for s in slides_estruturados:
-                # 🔄 Monta o conteúdo final legível e estruturado
-                texto_extraido = ""
-                for s in slides_estruturados:
-                    texto_extraido += f"\n\n=== SLIDE {s['slide_numero']} - {s['titulo']} ===\n"
-                    for e in s["elementos"]:
-                        texto_extraido += f"[linha {e['linha_visual']}] {e['texto']}\n"
+                texto_extraido += f"\n\n=== SLIDE {s['slide_numero']} - {s['titulo']} ===\n"
+                for f in s["faixas"]:
+                    texto_extraido += f"[Faixa {f['linha_visual']}] {f['conteudo']}\n"
 
-                # 🧹 Limpeza e normalização mais profunda
-                texto_extraido = (
-                    texto_extraido
-                    .replace("\\n", "\n")
-                    .replace("\r", "\n")
-                    .replace("\t", " ")
-                )
-                texto_extraido = re.sub(r"[\u0000-\u001F\u007F-\u009F]", " ",
-                                        texto_extraido)  # remove caracteres invisíveis
-                texto_extraido = re.sub(r"\u00A0", " ", texto_extraido)  # espaço não separável
-                texto_extraido = re.sub(r"\s{2,}", " ", texto_extraido)  # normaliza espaços duplos
-                texto_extraido = re.sub(r"\n{2,}", "\n", texto_extraido).strip()
+            # ========================================================
+            # 🧹 Limpeza e normalização profunda
+            # ========================================================
+            texto_extraido = (
+                texto_extraido
+                .replace("\\n", "\n")
+                .replace("\r", "\n")
+                .replace("\t", " ")
+            )
+            texto_extraido = re.sub(r"[\u0000-\u001F\u007F-\u009F]", " ",
+                                    texto_extraido)  # remove caracteres invisíveis
+            texto_extraido = re.sub(r"\u00A0", " ", texto_extraido)  # espaço não separável
+            texto_extraido = re.sub(r"\s{2,}", " ", texto_extraido)  # normaliza espaços duplos
+            texto_extraido = re.sub(r"\n{2,}", "\n", texto_extraido).strip()
 
-                os.remove(temp_path)
+            os.remove(temp_path)
 
-                # ✅ Retorna conteúdo híbrido (legível + estruturado)
-                return {
-                    "nome": nome,
-                    "tipo": mime,
-                    "conteudo": texto_extraido[:80000],  # texto limpo e pronto p/ análise GPT
-                    "conteudo_estruturado": slides_estruturados  # metadados com X/Y, linha_visual etc.
-                }
+            # ========================================================
+            # ✅ Retorno final híbrido (legível + estruturado)
+            # ========================================================
+            return {
+                "nome": nome,
+                "tipo": mime,
+                "conteudo": texto_extraido[:80000],  # texto limpo, pronto para análise GPT
+                "conteudo_estruturado": slides_estruturados  # com posição, faixas e notas
+            }
+
 
 
 
