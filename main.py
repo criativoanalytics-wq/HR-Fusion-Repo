@@ -96,17 +96,20 @@ def expandir_termos(query: str):
 # ============================================================
 # 📁 Listagem de arquivos (com expansão bilíngue)
 # ============================================================
+# ============================================================
+# 📁 Listagem de arquivos (com expansão bilíngue + paginação)
+# ============================================================
 @app.get("/files")
 def listar_arquivos(pasta_id: str = None, query: str = None):
     """
-    Lista arquivos de uma pasta ou faz busca textual no Drive.
-    - Expande automaticamente a busca com sinônimos bilíngues.
-    - Ignora maiúsculas/minúsculas.
+    Lista todos os arquivos do Google Drive (com paginação).
+    - Expande automaticamente termos bilíngues.
+    - Percorre todas as páginas (sem limite de 100 arquivos).
+    - Retorna lista completa com metadados.
     """
     try:
         service = get_service()
         termos_busca = expandir_termos(query)
-
         if not termos_busca:
             termos_busca = [query.lower()] if query else []
 
@@ -122,21 +125,29 @@ def listar_arquivos(pasta_id: str = None, query: str = None):
             q.append("trashed=false")
             query_final = " and ".join(q)
 
-            results = service.files().list(
-                q=query_final,
-                fields="files(id, name, mimeType, modifiedTime)",
-                pageSize=100
-            ).execute()
+            page_token = None
+            while True:
+                results = service.files().list(
+                    q=query_final,
+                    fields="nextPageToken, files(id, name, mimeType, modifiedTime, parents)",
+                    pageSize=100,
+                    pageToken=page_token
+                ).execute()
 
-            for f in results.get("files", []):
-                if f["id"] not in ids_vistos:
-                    arquivos_encontrados.append(f)
-                    ids_vistos.add(f["id"])
+                for f in results.get("files", []):
+                    if f["id"] not in ids_vistos:
+                        arquivos_encontrados.append(f)
+                        ids_vistos.add(f["id"])
 
-        return {"arquivos": arquivos_encontrados}
+                page_token = results.get("nextPageToken")
+                if not page_token:
+                    break  # ✅ todas as páginas lidas
+
+        return {"arquivos": arquivos_encontrados, "total": len(arquivos_encontrados)}
 
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Erro ao listar arquivos: {e}")
+
 
 
 @app.get("/smart_search")
