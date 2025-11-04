@@ -359,7 +359,7 @@ def ler_arquivo(file_id: str, range_inicio: int = 1, range_fim: int = 15):
                 slides_estruturados.append({
                     "slide_numero": i,
                     "titulo": titulo_slide,
-                    "elementos": elementos_ordenados,
+                    #"elementos": elementos_ordenados,
                     "faixas": faixas_agrupadas,
                     "notas": notas or ""
                 })
