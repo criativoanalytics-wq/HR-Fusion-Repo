@@ -261,7 +261,7 @@ def ler_arquivo(file_id: str):
             texto_extraido = fh.read().decode("utf-8", errors="ignore")
 
         # --------------------------------------------------------
-        # 🖼️ PPTX (PowerPoint) — leitura aprimorada e estruturada (corrigida)
+        # 🖼️ PPTX (PowerPoint) — leitura hierárquica com posição e estrutura
         # --------------------------------------------------------
         elif mime in [
             "application/vnd.openxmlformats-officedocument.presentationml.presentation",
@@ -274,91 +274,102 @@ def ler_arquivo(file_id: str):
                 temp_path = temp_file.name
 
             prs = Presentation(temp_path)
-            slides_text = []
+            slides_estruturados = []
 
-            # 🧩 Função auxiliar: extrair texto e tabelas (em Markdown)
-            def extrair_texto_shape(shape):
-                texto = []
-                try:
-                    # Caso o shape tenha texto puro
-                    if hasattr(shape, "text") and shape.text.strip():
-                        texto.append(shape.text.strip())
+            def extrair_texto_recursivo(shape, elementos):
+                """Extrai texto e posição de shapes, incluindo grupos e tabelas."""
+                if hasattr(shape, "text") and shape.text.strip():
+                    elementos.append({
+                        "texto": shape.text.strip(),
+                        "x": int(getattr(shape, "left", 0)),
+                        "y": int(getattr(shape, "top", 0)),
+                        "largura": int(getattr(shape, "width", 0)),
+                        "altura": int(getattr(shape, "height", 0)),
+                    })
+                # Percorre subshapes (grupos)
+                if hasattr(shape, "shapes"):
+                    for subshape in shape.shapes:
+                        extrair_texto_recursivo(subshape, elementos)
+                # Lê tabelas como texto concatenado
+                if hasattr(shape, "has_table") and shape.has_table:
+                    table = shape.table
+                    for row in table.rows:
+                        row_text = " | ".join(cell.text.strip() for cell in row.cells if cell.text.strip())
+                        if row_text:
+                            elementos.append({
+                                "texto": row_text,
+                                "x": int(getattr(shape, "left", 0)),
+                                "y": int(getattr(shape, "top", 0)),
+                                "largura": int(getattr(shape, "width", 0)),
+                                "altura": int(getattr(shape, "height", 0)),
+                            })
 
-                    # Caso o shape seja uma tabela
-                    if hasattr(shape, "has_table") and shape.has_table:
-                        table = shape.table
-                        headers = [cell.text.strip() for cell in table.rows[0].cells]
-                        markdown_table = []
-                        markdown_table.append("| " + " | ".join(headers) + " |")
-                        markdown_table.append("|" + "|".join(["---"] * len(headers)) + "|")
-                        for row in table.rows[1:]:
-                            markdown_table.append("| " + " | ".join([cell.text.strip() for cell in row.cells]) + " |")
-                        texto.append("\n".join(markdown_table))
-                except Exception as err:
-                    print(f"[WARN] Erro ao extrair shape: {err}")
-                return texto
-
-            # 🧠 Funções auxiliares seguras para ordenação
-            def get_shape_pos(shape):
-                """Retorna posição (top, left) segura, mesmo para objetos inválidos."""
-
-                def safe_val(v):
-                    try:
-                        if isinstance(v, (int, float)):
-                            return int(v)
-                        elif hasattr(v, "emu"):  # caso o valor seja do tipo Length (pptx)
-                            return int(v.emu)
-                        elif isinstance(v, str) and v.isdigit():
-                            return int(v)
-                    except Exception:
-                        pass
-                    return 0
-
-                try:
-                    return (safe_val(getattr(shape, "top", 0)), safe_val(getattr(shape, "left", 0)))
-                except Exception:
-                    return (0, 0)
-
-            # 🔁 Loop pelos slides
             for i, slide in enumerate(prs.slides, start=1):
-                try:
-                    shapes_sorted = sorted(slide.shapes, key=lambda s: get_shape_pos(s))
-                except Exception as err:
-                    print(f"[Slide {i}] Erro ao ordenar shapes: {err}")
-                    shapes_sorted = list(slide.shapes)  # fallback: mantém ordem original
+                elementos = []
 
-                slide_text = []
-                for shape in shapes_sorted:
-                    slide_text.extend(extrair_texto_shape(shape))
+                for shape in slide.shapes:
+                    extrair_texto_recursivo(shape, elementos)
 
-                # Adiciona cabeçalho numerado do slide
-                if slide_text:
-                    slides_text.append(f"\n\n=== SLIDE {i} ===\n" + "\n".join(slide_text))
+                # Agrupa por "linha visual" (faixas horizontais)
+                elementos_ordenados = sorted(elementos, key=lambda e: (e["y"], e["x"]))
 
-                # Inclui notas do apresentador (se existirem)
-                try:
-                    if slide.has_notes_slide and slide.notes_slide.notes_text_frame:
-                        nota = slide.notes_slide.notes_text_frame.text.strip()
-                        if nota:
-                            slides_text.append(f"\nNotas do Slide {i}: {nota}")
-                except Exception:
-                    pass
+                linha_id = 0
+                ultima_y = None
+                for el in elementos_ordenados:
+                    if ultima_y is None or abs(el["y"] - ultima_y) > 200000:  # espaçamento entre faixas
+                        linha_id += 1
+                        ultima_y = el["y"]
+                    el["linha_visual"] = linha_id
 
-            # 🔄 Junta todo o conteúdo dos slides
-            texto_extraido = "\n".join(slides_text)
+                # Coleta notas do apresentador (se houver)
+                notas = None
+                if slide.has_notes_slide and slide.notes_slide.notes_text_frame:
+                    notas = slide.notes_slide.notes_text_frame.text.strip()
 
-            # 🧹 Limpeza e normalização do texto
-            texto_extraido = texto_extraido.replace("\\n", "\n")
-            texto_extraido = re.sub(r"[|]+", " ", texto_extraido)  # Remove pipes duplicados fora de tabelas
-            texto_extraido = re.sub(r"\s*\n\s*", "\n", texto_extraido)  # Normaliza quebras
-            texto_extraido = re.sub(r"\n{2,}", "\n\n", texto_extraido)  # Mantém no máximo 1 linha em branco
-            texto_extraido = re.sub(r"\s{2,}", " ", texto_extraido)  # Remove múltiplos espaços
-            texto_extraido = re.sub(r"(?i)(m\d{1,2}\s*\(\w+\))", "",
-                                    texto_extraido)  # Remove marcações M1 (Jan), M2 (Feb) etc.
-            texto_extraido = re.sub(r"-{2,}", "—", texto_extraido)  # Corrige múltiplos traços
-            texto_extraido = texto_extraido.strip()
+                # Captura possível título
+                titulo_slide = next((e["texto"] for e in elementos_ordenados if e["linha_visual"] == 1), f"Slide {i}")
 
-            os.remove(temp_path)
+                slides_estruturados.append({
+                    "slide_numero": i,
+                    "titulo": titulo_slide,
+                    "elementos": elementos_ordenados,
+                    "notas": notas
+                })
+
+            # 🔄 Monta o conteúdo final
+            texto_extraido = ""
+            for s in slides_estruturados:
+                # 🔄 Monta o conteúdo final legível e estruturado
+                texto_extraido = ""
+                for s in slides_estruturados:
+                    texto_extraido += f"\n\n=== SLIDE {s['slide_numero']} - {s['titulo']} ===\n"
+                    for e in s["elementos"]:
+                        texto_extraido += f"[linha {e['linha_visual']}] {e['texto']}\n"
+
+                # 🧹 Limpeza e normalização mais profunda
+                texto_extraido = (
+                    texto_extraido
+                    .replace("\\n", "\n")
+                    .replace("\r", "\n")
+                    .replace("\t", " ")
+                )
+                texto_extraido = re.sub(r"[\u0000-\u001F\u007F-\u009F]", " ",
+                                        texto_extraido)  # remove caracteres invisíveis
+                texto_extraido = re.sub(r"\u00A0", " ", texto_extraido)  # espaço não separável
+                texto_extraido = re.sub(r"\s{2,}", " ", texto_extraido)  # normaliza espaços duplos
+                texto_extraido = re.sub(r"\n{2,}", "\n", texto_extraido).strip()
+
+                os.remove(temp_path)
+
+                # ✅ Retorna conteúdo híbrido (legível + estruturado)
+                return {
+                    "nome": nome,
+                    "tipo": mime,
+                    "conteudo": texto_extraido[:80000],  # texto limpo e pronto p/ análise GPT
+                    "conteudo_estruturado": slides_estruturados  # metadados com X/Y, linha_visual etc.
+                }
+
+
 
 
 
