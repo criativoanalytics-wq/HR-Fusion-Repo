@@ -219,8 +219,11 @@ def smart_search(query: str):
 # 📄 Leitura e extração de conteúdo (DOCX, PDF, TXT, PPTX)
 # ============================================================
 @app.get("/files/{file_id}")
-def ler_arquivo(file_id: str):
-    """Faz download e extrai texto de arquivos do Google Drive (.docx, .pdf, .txt, .pptx)."""
+def ler_arquivo(file_id: str, range_inicio: int = 1, range_fim: int = 15):
+    """
+    Faz download e extrai texto de arquivos (.docx, .pdf, .txt, .pptx),
+    com suporte a leitura paginada para PPTX muito grandes.
+    """
     try:
         service = get_service()
         file = service.files().get(fileId=file_id, fields="name, mimeType").execute()
@@ -233,7 +236,6 @@ def ler_arquivo(file_id: str):
         done = False
         while not done:
             status, done = downloader.next_chunk()
-
         fh.seek(0)
         texto_extraido = ""
 
@@ -261,19 +263,26 @@ def ler_arquivo(file_id: str):
             texto_extraido = fh.read().decode("utf-8", errors="ignore")
 
         # --------------------------------------------------------
-        # 🖼️ PPTX (PowerPoint) — leitura hierárquica e agrupamento por faixas visuais
+        # 🖼️ PPTX (PowerPoint) — leitura hierárquica e agrupamento por faixas visuais (com paginação segura)
         # --------------------------------------------------------
         elif mime in [
             "application/vnd.openxmlformats-officedocument.presentationml.presentation",
             "application/vnd.ms-powerpoint"
         ]:
             from pptx import Presentation
+            import re, tempfile, os
 
             with tempfile.NamedTemporaryFile(delete=False, suffix=".pptx") as temp_file:
                 temp_file.write(fh.read())
                 temp_path = temp_file.name
 
             prs = Presentation(temp_path)
+            total_slides = len(prs.slides)
+
+            # 🔹 Garante que os índices estejam dentro dos limites
+            range_inicio = max(1, min(range_inicio, total_slides))
+            range_fim = max(range_inicio, min(range_fim, total_slides))
+
             slides_estruturados = []
 
             def extrair_texto_recursivo(shape, elementos):
@@ -308,33 +317,33 @@ def ler_arquivo(file_id: str):
                             })
 
             # ========================================================
-            # 🔹 Loop principal dos slides
+            # 🔹 Loop principal dos slides no intervalo solicitado
             # ========================================================
-            for i, slide in enumerate(prs.slides, start=1):
+            for i in range(range_inicio, range_fim + 1):
+                slide = prs.slides[i - 1]
                 elementos = []
 
-                # Extrai shapes e tabelas
                 for shape in slide.shapes:
                     extrair_texto_recursivo(shape, elementos)
 
-                # Ordena por posição (topo → baixo, esquerda → direita)
+                # Ordena shapes (topo → baixo, esquerda → direita)
                 elementos_ordenados = sorted(elementos, key=lambda e: (e["y"], e["x"]))
 
                 # Agrupa por faixa horizontal
                 linha_id = 0
                 ultima_y = None
                 for el in elementos_ordenados:
-                    if ultima_y is None or abs(el["y"] - ultima_y) > 200000:  # espaçamento entre faixas
+                    if ultima_y is None or abs(el["y"] - ultima_y) > 200000:
                         linha_id += 1
                         ultima_y = el["y"]
                     el["linha_visual"] = linha_id
 
-                # Coleta notas do apresentador
+                # Notas do apresentador
                 notas = None
                 if slide.has_notes_slide and slide.notes_slide.notes_text_frame:
                     notas = slide.notes_slide.notes_text_frame.text.strip()
 
-                # Captura título do slide
+                # Título
                 titulo_slide = next((e["texto"] for e in elementos_ordenados if e["linha_visual"] == 1), f"Slide {i}")
 
                 # Agrupa conteúdo por faixa visual
@@ -373,10 +382,9 @@ def ler_arquivo(file_id: str):
                 .replace("\r", "\n")
                 .replace("\t", " ")
             )
-            texto_extraido = re.sub(r"[\u0000-\u001F\u007F-\u009F]", " ",
-                                    texto_extraido)  # remove caracteres invisíveis
-            texto_extraido = re.sub(r"\u00A0", " ", texto_extraido)  # espaço não separável
-            texto_extraido = re.sub(r"\s{2,}", " ", texto_extraido)  # normaliza espaços duplos
+            texto_extraido = re.sub(r"[\u0000-\u001F\u007F-\u009F]", " ", texto_extraido)
+            texto_extraido = re.sub(r"\u00A0", " ", texto_extraido)
+            texto_extraido = re.sub(r"\s{2,}", " ", texto_extraido)
             texto_extraido = re.sub(r"\n{2,}", "\n", texto_extraido).strip()
 
             os.remove(temp_path)
@@ -387,13 +395,11 @@ def ler_arquivo(file_id: str):
             return {
                 "nome": nome,
                 "tipo": mime,
-                "conteudo": texto_extraido[:80000],  # texto limpo, pronto para análise GPT
-                "conteudo_estruturado": slides_estruturados  # com posição, faixas e notas
+                "intervalo_lido": f"{range_inicio}-{range_fim}",
+                "total_slides": total_slides,
+                #"conteudo": texto_extraido[:80000],
+                "conteudo_estruturado": slides_estruturados
             }
-
-
-
-
 
 
 
