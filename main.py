@@ -261,13 +261,14 @@ def ler_arquivo(file_id: str):
             texto_extraido = fh.read().decode("utf-8", errors="ignore")
 
         # --------------------------------------------------------
-        # 🖼️ PPTX (PowerPoint)
+        # 🖼️ PPTX (PowerPoint) — leitura aprimorada e estruturada (corrigida)
         # --------------------------------------------------------
         elif mime in [
             "application/vnd.openxmlformats-officedocument.presentationml.presentation",
             "application/vnd.ms-powerpoint"
         ]:
             from pptx import Presentation
+
             with tempfile.NamedTemporaryFile(delete=False, suffix=".pptx") as temp_file:
                 temp_file.write(fh.read())
                 temp_path = temp_file.name
@@ -275,57 +276,91 @@ def ler_arquivo(file_id: str):
             prs = Presentation(temp_path)
             slides_text = []
 
+            # 🧩 Função auxiliar: extrair texto e tabelas (em Markdown)
             def extrair_texto_shape(shape):
-                """Extrai texto de caixas, tabelas e grupos de forma segura."""
                 texto = []
                 try:
-                    # Texto simples
-                    if hasattr(shape, "text") and shape.text:
-                        texto.append(shape.text)
+                    # Caso o shape tenha texto puro
+                    if hasattr(shape, "text") and shape.text.strip():
+                        texto.append(shape.text.strip())
 
-                    # Tabelas (com verificação de tipo)
+                    # Caso o shape seja uma tabela
                     if hasattr(shape, "has_table") and shape.has_table:
                         table = shape.table
-                        for row in table.rows:
-                            row_text = " | ".join([cell.text.strip() for cell in row.cells])
-                            texto.append(row_text)
-
-                    # Grupos de shapes (recursivo)
-                    if hasattr(shape, "shapes"):
-                        for subshape in shape.shapes:
-                            texto.extend(extrair_texto_shape(subshape))
-
-                except Exception as e:
-                    print(f"⚠️ Erro ao extrair texto do shape: {e}")
-
+                        headers = [cell.text.strip() for cell in table.rows[0].cells]
+                        markdown_table = []
+                        markdown_table.append("| " + " | ".join(headers) + " |")
+                        markdown_table.append("|" + "|".join(["---"] * len(headers)) + "|")
+                        for row in table.rows[1:]:
+                            markdown_table.append("| " + " | ".join([cell.text.strip() for cell in row.cells]) + " |")
+                        texto.append("\n".join(markdown_table))
+                except Exception as err:
+                    print(f"[WARN] Erro ao extrair shape: {err}")
                 return texto
 
-            for slide in prs.slides:
-                slide_text = [extrair_texto_shape(shape) for shape in slide.shapes]
-                flat_slide = [item for sublist in slide_text for item in sublist if item]
-                if flat_slide:
-                    slides_text.append(f"--- Slide ---\n" + "\n".join(flat_slide))
-                # notas do apresentador
-                if slide.has_notes_slide and slide.notes_slide.notes_text_frame:
-                    slides_text.append("Notas: " + slide.notes_slide.notes_text_frame.text)
+            # 🧠 Funções auxiliares seguras para ordenação
+            def get_shape_pos(shape):
+                """Retorna posição (top, left) segura, mesmo para objetos inválidos."""
 
+                def safe_val(v):
+                    try:
+                        if isinstance(v, (int, float)):
+                            return int(v)
+                        elif hasattr(v, "emu"):  # caso o valor seja do tipo Length (pptx)
+                            return int(v.emu)
+                        elif isinstance(v, str) and v.isdigit():
+                            return int(v)
+                    except Exception:
+                        pass
+                    return 0
+
+                try:
+                    return (safe_val(getattr(shape, "top", 0)), safe_val(getattr(shape, "left", 0)))
+                except Exception:
+                    return (0, 0)
+
+            # 🔁 Loop pelos slides
+            for i, slide in enumerate(prs.slides, start=1):
+                try:
+                    shapes_sorted = sorted(slide.shapes, key=lambda s: get_shape_pos(s))
+                except Exception as err:
+                    print(f"[Slide {i}] Erro ao ordenar shapes: {err}")
+                    shapes_sorted = list(slide.shapes)  # fallback: mantém ordem original
+
+                slide_text = []
+                for shape in shapes_sorted:
+                    slide_text.extend(extrair_texto_shape(shape))
+
+                # Adiciona cabeçalho numerado do slide
+                if slide_text:
+                    slides_text.append(f"\n\n=== SLIDE {i} ===\n" + "\n".join(slide_text))
+
+                # Inclui notas do apresentador (se existirem)
+                try:
+                    if slide.has_notes_slide and slide.notes_slide.notes_text_frame:
+                        nota = slide.notes_slide.notes_text_frame.text.strip()
+                        if nota:
+                            slides_text.append(f"\nNotas do Slide {i}: {nota}")
+                except Exception:
+                    pass
+
+            # 🔄 Junta todo o conteúdo dos slides
             texto_extraido = "\n".join(slides_text)
-            # 🧹 Limpeza do texto extraído
-            texto_extraido = re.sub(r"[|]+", " ", texto_extraido)  # Remove barras verticais de tabelas
-            texto_extraido = re.sub(r"\\n+", "\n", texto_extraido)  # Corrige quebras de linha duplas
-            texto_extraido = re.sub(r"\n{2,}", "\n", texto_extraido)  # Remove linhas em branco excessivas
-            texto_extraido = re.sub(r"\s{2,}", " ", texto_extraido)  # Normaliza múltiplos espaços
-            texto_extraido = re.sub(r"(?i)(m\d{1,2}\s*\(\w+\))", "", texto_extraido)  # Remove marcações tipo M1 (Jan)
-            texto_extraido = re.sub(r"-{2,}", "—", texto_extraido)  # Substitui vários traços por um travessão
-            # 🔄 Normaliza e remove \n literais ou escapados
-            texto_extraido = texto_extraido.replace("\\n", "\n")  # Transforma texto literal "\n" em quebra real
-            texto_extraido = re.sub(r"\s*\n\s*", "\n", texto_extraido)  # Remove espaços ao redor das quebras
-            texto_extraido = re.sub(r"\n{2,}", "\n", texto_extraido)  # Remove quebras duplicadas
-            texto_extraido = re.sub(r"(\n\s*){3,}", "\n\n", texto_extraido)  # Mantém no máximo 1 linha em branco
 
+            # 🧹 Limpeza e normalização do texto
+            texto_extraido = texto_extraido.replace("\\n", "\n")
+            texto_extraido = re.sub(r"[|]+", " ", texto_extraido)  # Remove pipes duplicados fora de tabelas
+            texto_extraido = re.sub(r"\s*\n\s*", "\n", texto_extraido)  # Normaliza quebras
+            texto_extraido = re.sub(r"\n{2,}", "\n\n", texto_extraido)  # Mantém no máximo 1 linha em branco
+            texto_extraido = re.sub(r"\s{2,}", " ", texto_extraido)  # Remove múltiplos espaços
+            texto_extraido = re.sub(r"(?i)(m\d{1,2}\s*\(\w+\))", "",
+                                    texto_extraido)  # Remove marcações M1 (Jan), M2 (Feb) etc.
+            texto_extraido = re.sub(r"-{2,}", "—", texto_extraido)  # Corrige múltiplos traços
             texto_extraido = texto_extraido.strip()
 
             os.remove(temp_path)
+
+
 
 
         # --------------------------------------------------------
