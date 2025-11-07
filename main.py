@@ -3,6 +3,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from google.oauth2.credentials import Credentials
 from googleapiclient.discovery import build
 from googleapiclient.http import MediaIoBaseDownload
+from fastapi.responses import StreamingResponse
 from io import BytesIO
 import os
 import tempfile
@@ -36,6 +37,9 @@ app.add_middleware(
 )
 
 SCOPES = ["https://www.googleapis.com/auth/drive.readonly"]
+MAX_PAYLOAD = 100_000  # Limite seguro de texto enviado
+CHUNK_PAGE_SIZE = 3    # Número de páginas/slides lidos por vez
+
 # Carrega modelos multilíngues
 nlp_en = spacy.load("en_core_web_sm")
 nlp_pt = spacy.load("pt_core_news_sm")
@@ -283,6 +287,17 @@ def smart_search(query: str):
         raise HTTPException(status_code=500, detail=f"Erro na busca expandida: {e}")
 
 # ============================================================
+# 📄 Função utilitária: leitura em blocos de texto
+# ============================================================
+
+def read_in_chunks(file_obj, chunk_size=8192):
+    """Gerador que lê arquivos em blocos pequenos."""
+    while True:
+        data = file_obj.read(chunk_size)
+        if not data:
+            break
+        yield data
+# ============================================================
 # 📄 Leitura e extração de conteúdo
 # ============================================================
 # ============================================================
@@ -291,9 +306,8 @@ def smart_search(query: str):
 @app.get("/files/{file_id}")
 def ler_arquivo(file_id: str, range_inicio: int = 1, range_fim: int = 15):
     """
-    📄 Leitura otimizada de arquivos do Google Drive (.docx, .pdf, .txt, .pptx)
-    - Faz download em chunks (streaming), sem carregar o arquivo inteiro em memória.
-    - Extrai conteúdo textual.
+    Faz download e leitura de arquivos do Google Drive (DOCX, PDF, TXT, PPTX)
+    com suporte a leitura por chunks, payload limitado e fallback fragmentado.
     """
     try:
         service = get_service()
@@ -301,9 +315,7 @@ def ler_arquivo(file_id: str, range_inicio: int = 1, range_fim: int = 15):
         nome = file["name"]
         mime = file["mimeType"]
 
-        # ===============================================
-        # 🚀 Download em chunks (streaming)
-        # ===============================================
+        # 📦 Download seguro em chunks
         with tempfile.NamedTemporaryFile(delete=False, suffix=os.path.splitext(nome)[-1]) as tmp_file:
             request = service.files().get_media(fileId=file_id)
             downloader = MediaIoBaseDownload(tmp_file, request)
@@ -315,38 +327,45 @@ def ler_arquivo(file_id: str, range_inicio: int = 1, range_fim: int = 15):
             temp_path = tmp_file.name
 
         texto_extraido = ""
+        total_paginas = 0
 
-        # ===============================================
-        # 🧩 DOCX
-        # ===============================================
+        # ------------------------------------------------------------
+        # DOCX
+        # ------------------------------------------------------------
         if mime == "application/vnd.openxmlformats-officedocument.wordprocessingml.document":
             texto_extraido = docx2txt.process(temp_path)
 
-        # ===============================================
-        # 📘 PDF (stream de páginas)
-        # ===============================================
+        # ------------------------------------------------------------
+        # PDF (em blocos de páginas)
+        # ------------------------------------------------------------
         elif mime == "application/pdf":
             with open(temp_path, "rb") as f:
                 reader = PdfReader(f)
-                partes = []
-                for page in reader.pages:
+                total_paginas = len(reader.pages)
+                blocos = []
+                for i, page in enumerate(reader.pages, start=1):
                     texto = page.extract_text() or ""
-                    partes.append(texto)
-                texto_extraido = "\n".join(partes)
+                    blocos.append(texto)
+                    # Interrompe e envia resultado parcial se exceder o limite
+                    if len("".join(blocos)) > MAX_PAYLOAD:
+                        break
+                texto_extraido = "\n".join(blocos)
 
-        # ===============================================
-        # 📄 TXT (leitura incremental)
-        # ===============================================
+        # ------------------------------------------------------------
+        # TXT (stream de leitura incremental)
+        # ------------------------------------------------------------
         elif "text" in mime:
             with open(temp_path, "r", encoding="utf-8", errors="ignore") as f:
                 partes = []
-                for chunk in iter(lambda: f.read(8192), ""):  # lê em blocos de 8KB
+                for chunk in read_in_chunks(f, 8192):
                     partes.append(chunk)
+                    if sum(len(p) for p in partes) > MAX_PAYLOAD:
+                        break
                 texto_extraido = "".join(partes)
 
-        # ===============================================
-        # 🖼️ PPTX (com paginação)
-        # ===============================================
+        # ------------------------------------------------------------
+        # PPTX (leitura parcial em slides)
+        # ------------------------------------------------------------
         elif mime in [
             "application/vnd.openxmlformats-officedocument.presentationml.presentation",
             "application/vnd.ms-powerpoint"
@@ -356,111 +375,85 @@ def ler_arquivo(file_id: str, range_inicio: int = 1, range_fim: int = 15):
             range_inicio = max(1, min(range_inicio, total_slides))
             range_fim = max(range_inicio, min(range_fim, total_slides))
 
-            slides_estruturados = []
-
-            def extrair_texto_recursivo(shape, elementos):
-                if hasattr(shape, "text") and shape.text.strip():
-                    elementos.append({
-                        "texto": shape.text.strip(),
-                        "x": int(getattr(shape, "left", 0)),
-                        "y": int(getattr(shape, "top", 0))
-                    })
-                if hasattr(shape, "shapes"):
-                    for subshape in shape.shapes:
-                        extrair_texto_recursivo(subshape, elementos)
-                if hasattr(shape, "has_table") and shape.has_table:
-                    table = shape.table
-                    for row in table.rows:
-                        row_text = " | ".join(
-                            cell.text.strip() for cell in row.cells if cell.text.strip()
-                        )
-                        if row_text:
-                            elementos.append({
-                                "texto": row_text,
-                                "x": int(getattr(shape, "left", 0)),
-                                "y": int(getattr(shape, "top", 0))
-                            })
-
+            slides_texto = []
             for i in range(range_inicio, range_fim + 1):
                 slide = prs.slides[i - 1]
-                elementos = []
+                textos = []
                 for shape in slide.shapes:
-                    extrair_texto_recursivo(shape, elementos)
-
-                elementos_ordenados = sorted(elementos, key=lambda e: (e["y"], e["x"]))
-                linha_id, ultima_y = 0, None
-                for el in elementos_ordenados:
-                    if ultima_y is None or abs(el["y"] - ultima_y) > 200000:
-                        linha_id += 1
-                        ultima_y = el["y"]
-                    el["linha_visual"] = linha_id
-
-                faixas = {}
-                for e in elementos_ordenados:
-                    faixa_id = e["linha_visual"]
-                    faixas.setdefault(faixa_id, []).append(e["texto"])
-                faixas_agrupadas = [
-                    {"linha_visual": k, "conteudo": " ".join(v)} for k, v in faixas.items()
-                ]
-
-                notas = ""
-                if slide.has_notes_slide and slide.notes_slide.notes_text_frame:
-                    notas = slide.notes_slide.notes_text_frame.text.strip()
-
-                titulo_slide = next(
-                    (e["texto"] for e in elementos_ordenados if e["linha_visual"] == 1),
-                    f"Slide {i}"
-                )
-
-                slides_estruturados.append({
-                    "slide_numero": i,
-                    "titulo": titulo_slide,
-                    "faixas": faixas_agrupadas,
-                    "notas": notas
-                })
-
-            texto_extraido = ""
-            for s in slides_estruturados:
-                texto_extraido += f"\n\n=== SLIDE {s['slide_numero']} - {s['titulo']} ===\n"
-                for f in s["faixas"]:
-                    texto_extraido += f"[Faixa {f['linha_visual']}] {f['conteudo']}\n"
-
-            texto_extraido = (
-                texto_extraido.replace("\\n", "\n")
-                .replace("\r", "\n")
-                .replace("\t", " ")
-            )
-            texto_extraido = re.sub(r"[\u0000-\u001F\u007F-\u009F]", " ", texto_extraido)
-            texto_extraido = re.sub(r"\u00A0", " ", texto_extraido)
-            texto_extraido = re.sub(r"\s{2,}", " ", texto_extraido)
-            texto_extraido = re.sub(r"\n{2,}", "\n", texto_extraido).strip()
-
-            os.remove(temp_path)
-            return {
-                "nome": nome,
-                "tipo": mime,
-                "intervalo_lido": f"{range_inicio}-{range_fim}",
-                "total_slides": total_slides,
-                "conteudo": texto_extraido[:100000],
-                "conteudo_estruturado": slides_estruturados
-            }
+                    if hasattr(shape, "text") and shape.text.strip():
+                        textos.append(shape.text.strip())
+                slides_texto.append(f"[Slide {i}] {' '.join(textos)}")
+                if len("\n".join(slides_texto)) > MAX_PAYLOAD:
+                    break
+            texto_extraido = "\n".join(slides_texto)
 
         else:
             texto_extraido = f"O tipo de arquivo {mime} não é suportado para leitura direta."
 
         os.remove(temp_path)
 
-        if not isinstance(texto_extraido, str) or not texto_extraido.strip():
+        # Sanitização final
+        texto_extraido = re.sub(r"[\u0000-\u001F\u007F-\u009F]", " ", texto_extraido)
+        texto_extraido = re.sub(r"\s{2,}", " ", texto_extraido).strip()
+
+        if len(texto_extraido) > MAX_PAYLOAD:
+            texto_extraido = texto_extraido[:MAX_PAYLOAD] + "\n\n[⚠️ Conteúdo truncado para compatibilidade de payload.]"
+
+        if not texto_extraido.strip():
             texto_extraido = "⚠️ O arquivo foi encontrado, mas não contém texto legível."
 
         return {
             "nome": nome,
             "tipo": mime,
-            "conteudo": texto_extraido[:100000]
+            "intervalo_lido": f"{range_inicio}-{range_fim}",
+            "conteudo": texto_extraido
         }
 
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Erro ao ler arquivo: {e}")
+
+
+@app.get("/files/{file_id}/stream")
+def stream_arquivo(file_id: str):
+    """Retorna o conteúdo do arquivo em streaming incremental."""
+    def iterar():
+        service = get_service()
+        file = service.files().get(fileId=file_id, fields="name, mimeType").execute()
+        nome = file["name"]
+        request = service.files().get_media(fileId=file_id)
+        with tempfile.NamedTemporaryFile(delete=False, suffix=os.path.splitext(nome)[-1]) as tmp:
+            downloader = MediaIoBaseDownload(tmp, request)
+            done = False
+            while not done:
+                status, done = downloader.next_chunk()
+                if status:
+                    print(f"Baixando {int(status.progress() * 100)}%...")
+            tmp.seek(0)
+            for chunk in read_in_chunks(tmp, 8192):
+                yield chunk
+    return StreamingResponse(iterar(), media_type="text/plain")
+
+
+@app.get("/files")
+def listar_arquivos(pasta_id: str = None, query: str = None):
+    try:
+        service = get_service()
+        q = []
+        if pasta_id:
+            q.append(f"'{pasta_id}' in parents")
+        if query:
+            q.append(f"name contains '{query.lower()}'")
+        q.append("trashed=false")
+        query_final = " and ".join(q)
+        results = service.files().list(
+            q=query_final,
+            fields="files(id, name, mimeType, modifiedTime, parents)",
+            pageSize=100
+        ).execute()
+        return {"arquivos": results.get("files", []), "total": len(results.get("files", []))}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Erro ao listar arquivos: {e}")
+
 
 @app.get("/index_drive")
 def indexar_drive(pasta_raiz: str = None):
