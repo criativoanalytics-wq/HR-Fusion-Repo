@@ -12,6 +12,7 @@ import re
 import spacy
 import json
 from datetime import datetime
+from pptx import Presentation
 
 # ============================================================
 # 🚀 AIDA DRIVE CONNECTOR - RAG VERSION (Multilíngue e Smart)
@@ -154,13 +155,11 @@ def listar_arquivos(pasta_id: str = None, query: str = None):
 @app.get("/smart_read")
 def smart_read(file_id: str, query: str):
     """
-    Busca leve dentro de um PPTX do Google Drive.
-    Retorna apenas os slides que contêm o termo especificado.
-    Ideal para agentes com limite de payload.
+    Busca leve dentro de um PowerPoint (.pptx) no Google Drive.
+    Agora faz download e leitura em chunks, evitando carregar tudo em memória.
     """
     try:
         from pptx import Presentation
-        from io import BytesIO
         import re, tempfile, os
 
         if not query:
@@ -177,17 +176,15 @@ def smart_read(file_id: str, query: str):
         ]:
             raise HTTPException(status_code=400, detail="O arquivo não é um PowerPoint (.pptx).")
 
-        # 📦 Download temporário
-        request = service.files().get_media(fileId=file_id)
-        fh = BytesIO()
-        downloader = MediaIoBaseDownload(fh, request)
-        done = False
-        while not done:
-            status, done = downloader.next_chunk()
-        fh.seek(0)
-
+        # 📦 Download com chunks
         with tempfile.NamedTemporaryFile(delete=False, suffix=".pptx") as tmp:
-            tmp.write(fh.read())
+            request = service.files().get_media(fileId=file_id)
+            downloader = MediaIoBaseDownload(tmp, request)
+            done = False
+            while not done:
+                status, done = downloader.next_chunk()
+                if status:
+                    print(f"Baixando {int(status.progress() * 100)}% de {nome}")
             tmp_path = tmp.name
 
         prs = Presentation(tmp_path)
@@ -199,39 +196,25 @@ def smart_read(file_id: str, query: str):
             for shape in slide.shapes:
                 if hasattr(shape, "text") and shape.text.strip():
                     textos.append(shape.text.strip())
-            full_text = " ".join(textos)
-            full_text = re.sub(r"\s{2,}", " ", full_text).strip()
-
+            full_text = re.sub(r"\s{2,}", " ", " ".join(textos).strip())
             titulo = textos[0] if textos else f"Slide {i}"
-            slides.append({
-                "slide_numero": i,
-                "titulo": titulo,
-                "conteudo": full_text
-            })
+            slides.append({"slide_numero": i, "titulo": titulo, "conteudo": full_text})
 
-        # 🔍 Busca simples (case-insensitive)
         query_regex = re.compile(re.escape(query), re.IGNORECASE)
-        resultados = [
-            s for s in slides
-            if query_regex.search(s["conteudo"])
-        ]
+        resultados = [s for s in slides if query_regex.search(s["conteudo"])]
 
-        if not resultados:
-            return {
-                "arquivo": nome,
-                "query": query,
-                "total_slides": len(slides),
-                "resultados": [],
-                "mensagem": "Nenhum slide contém o termo buscado."
-            }
-
-        # 🔎 Resumo dos resultados (leve para GPT)
         return {
             "arquivo": nome,
             "query": query,
             "total_slides": len(slides),
             "slides_encontrados": len(resultados),
-            "resultados": resultados[:10]  # limite de segurança
+            "resultados": resultados[:10],
+        } if resultados else {
+            "arquivo": nome,
+            "query": query,
+            "mensagem": "Nenhum slide contém o termo buscado.",
+            "total_slides": len(slides),
+            "resultados": []
         }
 
     except Exception as e:
@@ -308,154 +291,151 @@ def smart_search(query: str):
 @app.get("/files/{file_id}")
 def ler_arquivo(file_id: str, range_inicio: int = 1, range_fim: int = 15):
     """
-    Faz download e extrai texto de arquivos (.docx, .pdf, .txt, .pptx),
-    com suporte a leitura paginada e tolerância a falhas.
+    📄 Leitura otimizada de arquivos do Google Drive (.docx, .pdf, .txt, .pptx)
+    - Faz download em chunks (streaming), sem carregar o arquivo inteiro em memória.
+    - Extrai conteúdo textual.
     """
-    import tempfile as tmp
-    import re, os
-    from pptx import Presentation
-
     try:
         service = get_service()
         file = service.files().get(fileId=file_id, fields="name, mimeType").execute()
         nome = file["name"]
         mime = file["mimeType"]
 
-        request = service.files().get_media(fileId=file_id)
-        fh = BytesIO()
-        downloader = MediaIoBaseDownload(fh, request)
-        done = False
-        while not done:
-            status, done = downloader.next_chunk()
-        fh.seek(0)
+        # ===============================================
+        # 🚀 Download em chunks (streaming)
+        # ===============================================
+        with tempfile.NamedTemporaryFile(delete=False, suffix=os.path.splitext(nome)[-1]) as tmp_file:
+            request = service.files().get_media(fileId=file_id)
+            downloader = MediaIoBaseDownload(tmp_file, request)
+            done = False
+            while not done:
+                status, done = downloader.next_chunk()
+                if status:
+                    print(f"Baixando {int(status.progress() * 100)}% de {nome}")
+            temp_path = tmp_file.name
+
         texto_extraido = ""
 
-        # --------------------------------------------------------
+        # ===============================================
         # 🧩 DOCX
-        # --------------------------------------------------------
+        # ===============================================
         if mime == "application/vnd.openxmlformats-officedocument.wordprocessingml.document":
-            try:
-                with tmp.NamedTemporaryFile(delete=False, suffix=".docx") as temp_file:
-                    temp_file.write(fh.read())
-                    temp_path = temp_file.name
-                texto_extraido = docx2txt.process(temp_path)
-            finally:
-                if os.path.exists(temp_path):
-                    os.remove(temp_path)
+            texto_extraido = docx2txt.process(temp_path)
 
-        # --------------------------------------------------------
-        # 📘 PDF
-        # --------------------------------------------------------
+        # ===============================================
+        # 📘 PDF (stream de páginas)
+        # ===============================================
         elif mime == "application/pdf":
-            reader = PdfReader(fh)
-            texto_extraido = "\n".join([p.extract_text() or "" for p in reader.pages])
+            with open(temp_path, "rb") as f:
+                reader = PdfReader(f)
+                partes = []
+                for page in reader.pages:
+                    texto = page.extract_text() or ""
+                    partes.append(texto)
+                texto_extraido = "\n".join(partes)
 
-        # --------------------------------------------------------
-        # 📄 TXT
-        # --------------------------------------------------------
+        # ===============================================
+        # 📄 TXT (leitura incremental)
+        # ===============================================
         elif "text" in mime:
-            texto_extraido = fh.read().decode("utf-8", errors="ignore")
+            with open(temp_path, "r", encoding="utf-8", errors="ignore") as f:
+                partes = []
+                for chunk in iter(lambda: f.read(8192), ""):  # lê em blocos de 8KB
+                    partes.append(chunk)
+                texto_extraido = "".join(partes)
 
-        # --------------------------------------------------------
-        # 🖼️ PPTX (PowerPoint) — leitura hierárquica com paginação
-        # --------------------------------------------------------
+        # ===============================================
+        # 🖼️ PPTX (com paginação)
+        # ===============================================
         elif mime in [
             "application/vnd.openxmlformats-officedocument.presentationml.presentation",
             "application/vnd.ms-powerpoint"
         ]:
-            try:
-                with tmp.NamedTemporaryFile(delete=False, suffix=".pptx") as temp_file:
-                    temp_file.write(fh.read())
-                    temp_path = temp_file.name
+            prs = Presentation(temp_path)
+            total_slides = len(prs.slides)
+            range_inicio = max(1, min(range_inicio, total_slides))
+            range_fim = max(range_inicio, min(range_fim, total_slides))
 
-                prs = Presentation(temp_path)
-                total_slides = len(prs.slides)
-                range_inicio = max(1, min(range_inicio, total_slides))
-                range_fim = max(range_inicio, min(range_fim, total_slides))
+            slides_estruturados = []
 
-                slides_estruturados = []
-
-                def extrair_texto_recursivo(shape, elementos):
-                    if hasattr(shape, "text") and shape.text.strip():
-                        elementos.append({
-                            "texto": shape.text.strip(),
-                            "x": int(getattr(shape, "left", 0)),
-                            "y": int(getattr(shape, "top", 0))
-                        })
-                    if hasattr(shape, "shapes"):
-                        for subshape in shape.shapes:
-                            extrair_texto_recursivo(subshape, elementos)
-                    if hasattr(shape, "has_table") and shape.has_table:
-                        table = shape.table
-                        for row in table.rows:
-                            row_text = " | ".join(
-                                cell.text.strip() for cell in row.cells if cell.text.strip()
-                            )
-                            if row_text:
-                                elementos.append({
-                                    "texto": row_text,
-                                    "x": int(getattr(shape, "left", 0)),
-                                    "y": int(getattr(shape, "top", 0))
-                                })
-
-                for i in range(range_inicio, range_fim + 1):
-                    slide = prs.slides[i - 1]
-                    elementos = []
-                    for shape in slide.shapes:
-                        extrair_texto_recursivo(shape, elementos)
-
-                    elementos_ordenados = sorted(elementos, key=lambda e: (e["y"], e["x"]))
-                    linha_id, ultima_y = 0, None
-                    for el in elementos_ordenados:
-                        if ultima_y is None or abs(el["y"] - ultima_y) > 200000:
-                            linha_id += 1
-                            ultima_y = el["y"]
-                        el["linha_visual"] = linha_id
-
-                    faixas = {}
-                    for e in elementos_ordenados:
-                        faixa_id = e["linha_visual"]
-                        faixas.setdefault(faixa_id, []).append(e["texto"])
-                    faixas_agrupadas = [
-                        {"linha_visual": k, "conteudo": " ".join(v)} for k, v in faixas.items()
-                    ]
-
-                    notas = ""
-                    if slide.has_notes_slide and slide.notes_slide.notes_text_frame:
-                        notas = slide.notes_slide.notes_text_frame.text.strip()
-
-                    titulo_slide = next(
-                        (e["texto"] for e in elementos_ordenados if e["linha_visual"] == 1),
-                        f"Slide {i}"
-                    )
-
-                    slides_estruturados.append({
-                        "slide_numero": i,
-                        "titulo": titulo_slide,
-                        "faixas": faixas_agrupadas,
-                        "notas": notas
+            def extrair_texto_recursivo(shape, elementos):
+                if hasattr(shape, "text") and shape.text.strip():
+                    elementos.append({
+                        "texto": shape.text.strip(),
+                        "x": int(getattr(shape, "left", 0)),
+                        "y": int(getattr(shape, "top", 0))
                     })
+                if hasattr(shape, "shapes"):
+                    for subshape in shape.shapes:
+                        extrair_texto_recursivo(subshape, elementos)
+                if hasattr(shape, "has_table") and shape.has_table:
+                    table = shape.table
+                    for row in table.rows:
+                        row_text = " | ".join(
+                            cell.text.strip() for cell in row.cells if cell.text.strip()
+                        )
+                        if row_text:
+                            elementos.append({
+                                "texto": row_text,
+                                "x": int(getattr(shape, "left", 0)),
+                                "y": int(getattr(shape, "top", 0))
+                            })
 
-                texto_extraido = ""
-                for s in slides_estruturados:
-                    texto_extraido += f"\n\n=== SLIDE {s['slide_numero']} - {s['titulo']} ===\n"
-                    for f in s["faixas"]:
-                        texto_extraido += f"[Faixa {f['linha_visual']}] {f['conteudo']}\n"
+            for i in range(range_inicio, range_fim + 1):
+                slide = prs.slides[i - 1]
+                elementos = []
+                for shape in slide.shapes:
+                    extrair_texto_recursivo(shape, elementos)
 
-                texto_extraido = (
-                    texto_extraido.replace("\\n", "\n")
-                    .replace("\r", "\n")
-                    .replace("\t", " ")
+                elementos_ordenados = sorted(elementos, key=lambda e: (e["y"], e["x"]))
+                linha_id, ultima_y = 0, None
+                for el in elementos_ordenados:
+                    if ultima_y is None or abs(el["y"] - ultima_y) > 200000:
+                        linha_id += 1
+                        ultima_y = el["y"]
+                    el["linha_visual"] = linha_id
+
+                faixas = {}
+                for e in elementos_ordenados:
+                    faixa_id = e["linha_visual"]
+                    faixas.setdefault(faixa_id, []).append(e["texto"])
+                faixas_agrupadas = [
+                    {"linha_visual": k, "conteudo": " ".join(v)} for k, v in faixas.items()
+                ]
+
+                notas = ""
+                if slide.has_notes_slide and slide.notes_slide.notes_text_frame:
+                    notas = slide.notes_slide.notes_text_frame.text.strip()
+
+                titulo_slide = next(
+                    (e["texto"] for e in elementos_ordenados if e["linha_visual"] == 1),
+                    f"Slide {i}"
                 )
-                texto_extraido = re.sub(r"[\u0000-\u001F\u007F-\u009F]", " ", texto_extraido)
-                texto_extraido = re.sub(r"\u00A0", " ", texto_extraido)
-                texto_extraido = re.sub(r"\s{2,}", " ", texto_extraido)
-                texto_extraido = re.sub(r"\n{2,}", "\n", texto_extraido).strip()
 
-            finally:
-                if os.path.exists(temp_path):
-                    os.remove(temp_path)
+                slides_estruturados.append({
+                    "slide_numero": i,
+                    "titulo": titulo_slide,
+                    "faixas": faixas_agrupadas,
+                    "notas": notas
+                })
 
+            texto_extraido = ""
+            for s in slides_estruturados:
+                texto_extraido += f"\n\n=== SLIDE {s['slide_numero']} - {s['titulo']} ===\n"
+                for f in s["faixas"]:
+                    texto_extraido += f"[Faixa {f['linha_visual']}] {f['conteudo']}\n"
+
+            texto_extraido = (
+                texto_extraido.replace("\\n", "\n")
+                .replace("\r", "\n")
+                .replace("\t", " ")
+            )
+            texto_extraido = re.sub(r"[\u0000-\u001F\u007F-\u009F]", " ", texto_extraido)
+            texto_extraido = re.sub(r"\u00A0", " ", texto_extraido)
+            texto_extraido = re.sub(r"\s{2,}", " ", texto_extraido)
+            texto_extraido = re.sub(r"\n{2,}", "\n", texto_extraido).strip()
+
+            os.remove(temp_path)
             return {
                 "nome": nome,
                 "tipo": mime,
@@ -465,14 +445,13 @@ def ler_arquivo(file_id: str, range_inicio: int = 1, range_fim: int = 15):
                 "conteudo_estruturado": slides_estruturados
             }
 
-        # --------------------------------------------------------
-        # ❗ Outros formatos
-        # --------------------------------------------------------
         else:
             texto_extraido = f"O tipo de arquivo {mime} não é suportado para leitura direta."
 
+        os.remove(temp_path)
+
         if not isinstance(texto_extraido, str) or not texto_extraido.strip():
-            texto_extraido = "⚠️ O arquivo foi encontrado, mas parece não conter texto legível."
+            texto_extraido = "⚠️ O arquivo foi encontrado, mas não contém texto legível."
 
         return {
             "nome": nome,
@@ -486,16 +465,29 @@ def ler_arquivo(file_id: str, range_inicio: int = 1, range_fim: int = 15):
 @app.get("/index_drive")
 def indexar_drive(pasta_raiz: str = None):
     """
-    🔄 Indexa todo o conteúdo do Google Drive (recursivamente).
-    - Lista todas as pastas e arquivos com paginação.
-    - Armazena metadados em drive_index.json para uso rápido.
+    🔄 Indexa o conteúdo do Google Drive (recursivamente) com paginação em chunks.
+    - Armazena resultados parciais a cada 500 arquivos (checkpoints).
+    - Evita manter o índice inteiro em memória.
     """
     try:
         service = get_service()
         arquivos_indexados = []
-        pastas_a_visitar = [pasta_raiz] if pasta_raiz else [ "root" ]
+        pastas_a_visitar = [pasta_raiz or "root"]
+        total_processados = 0
+
+        os.makedirs("index_cache", exist_ok=True)
+        index_path = "index_cache/drive_index.json"
+
+        def salvar_checkpoint():
+            with open(index_path, "w", encoding="utf-8") as f:
+                json.dump({
+                    "timestamp": datetime.utcnow().isoformat(),
+                    "total_itens": total_processados,
+                    "arquivos": arquivos_indexados[-500:]
+                }, f, ensure_ascii=False, indent=2)
 
         def listar_conteudo(pasta_id, caminho_atual=""):
+            nonlocal total_processados
             page_token = None
             while True:
                 results = service.files().list(
@@ -509,8 +501,12 @@ def indexar_drive(pasta_raiz: str = None):
                     caminho = f"{caminho_atual}/{item['name']}".strip("/")
                     item["path"] = caminho
                     arquivos_indexados.append(item)
+                    total_processados += 1
 
-                    # Se for pasta → adiciona à fila
+                    # Salva checkpoints a cada 500 arquivos
+                    if total_processados % 500 == 0:
+                        salvar_checkpoint()
+
                     if item["mimeType"] == "application/vnd.google-apps.folder":
                         listar_conteudo(item["id"], caminho)
 
@@ -518,29 +514,20 @@ def indexar_drive(pasta_raiz: str = None):
                 if not page_token:
                     break
 
-        # 🔁 Inicia varredura
         for pasta_id in pastas_a_visitar:
             listar_conteudo(pasta_id)
 
-        # 📦 Cria diretório local para índice
-        os.makedirs("index_cache", exist_ok=True)
-        index_path = f"index_cache/drive_index.json"
-
-        with open(index_path, "w", encoding="utf-8") as f:
-            json.dump({
-                "timestamp": datetime.utcnow().isoformat(),
-                "total_itens": len(arquivos_indexados),
-                "arquivos": arquivos_indexados
-            }, f, ensure_ascii=False, indent=2)
+        salvar_checkpoint()
 
         return {
             "status": "✅ Indexação concluída com sucesso",
-            "total_arquivos": len(arquivos_indexados),
+            "total_arquivos": total_processados,
             "index_path": index_path
         }
 
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Erro ao indexar o Drive: {e}")
+
 # ============================================================
 # 🔍 Endpoint raiz
 # ============================================================
