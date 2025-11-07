@@ -477,7 +477,7 @@ def ler_arquivo(file_id: str, range_inicio: int = 1, range_fim: int = 15):
         return {
             "nome": nome,
             "tipo": mime,
-            "conteudo": texto_extraido[:50000]
+            "conteudo": texto_extraido[:150000]
         }
 
     except Exception as e:
