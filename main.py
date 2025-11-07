@@ -303,11 +303,15 @@ def read_in_chunks(file_obj, chunk_size=8192):
 # ============================================================
 # 📄 Leitura e extração de conteúdo (DOCX, PDF, TXT, PPTX)
 # ============================================================
+# ============================================================
+# 📄 Função principal de leitura de arquivos (com suporte a Google Docs)
+# ============================================================
+
 @app.get("/files/{file_id}")
 def ler_arquivo(file_id: str, range_inicio: int = 1, range_fim: int = 15):
     """
-    Faz download e leitura de arquivos do Google Drive (DOCX, PDF, TXT, PPTX)
-    com suporte a leitura por chunks, payload limitado e fallback fragmentado.
+    Faz download e leitura de arquivos do Google Drive (DOCX, PDF, TXT, PPTX e Google Docs)
+    com suporte a leitura por chunks, payload limitado e fallback seguro para export.
     """
     try:
         service = get_service()
@@ -315,30 +319,67 @@ def ler_arquivo(file_id: str, range_inicio: int = 1, range_fim: int = 15):
         nome = file["name"]
         mime = file["mimeType"]
 
-        # 📦 Download seguro em chunks
+        # 🔍 Mapa de MIME para exportação de arquivos nativos do Google
+        google_export_map = {
+            "application/vnd.google-apps.document": "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+            "application/vnd.google-apps.spreadsheet": "text/csv",
+            "application/vnd.google-apps.presentation": "application/vnd.openxmlformats-officedocument.presentationml.presentation"
+        }
+
+        # Caminho temporário para armazenar o arquivo exportado ou baixado
+        temp_path = None
+
+        # ============================================================
+        # 📦 Download inteligente com fallback seguro
+        # ============================================================
         with tempfile.NamedTemporaryFile(delete=False, suffix=os.path.splitext(nome)[-1]) as tmp_file:
-            request = service.files().get_media(fileId=file_id)
+            if mime in google_export_map:
+                # 🔹 É um Google Docs, Sheets ou Slides → exporta
+                export_mime = google_export_map[mime]
+                print(f"Exportando '{nome}' como {export_mime}")
+                request = service.files().export_media(fileId=file_id, mimeType=export_mime)
+            else:
+                # 🔹 É um arquivo binário normal → get_media
+                print(f"Baixando '{nome}' via get_media()")
+                request = service.files().get_media(fileId=file_id)
+
             downloader = MediaIoBaseDownload(tmp_file, request)
             done = False
             while not done:
-                status, done = downloader.next_chunk()
-                if status:
-                    print(f"Baixando {int(status.progress() * 100)}% de {nome}")
+                try:
+                    status, done = downloader.next_chunk()
+                    if status:
+                        print(f"Baixando {int(status.progress() * 100)}% de {nome}")
+                except Exception as e:
+                    # ✅ Tratamento de erros 403 específicos
+                    if "fileNotExportable" in str(e) or "fileNotDownloadable" in str(e):
+                        raise HTTPException(
+                            status_code=415,
+                            detail=f"O arquivo '{nome}' ({mime}) não pode ser exportado nem baixado. Tipo não suportado para leitura."
+                        )
+                    raise
             temp_path = tmp_file.name
+
+        if not temp_path or not os.path.exists(temp_path):
+            raise HTTPException(status_code=400, detail=f"Falha ao baixar o arquivo '{nome}' do Drive.")
 
         texto_extraido = ""
         total_paginas = 0
 
-        # ------------------------------------------------------------
-        # DOCX
-        # ------------------------------------------------------------
-        if mime == "application/vnd.openxmlformats-officedocument.wordprocessingml.document":
+        # ============================================================
+        # 🧩 DOCX
+        # ============================================================
+        if mime in [
+            "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+            "application/vnd.google-apps.document"
+        ]:
             texto_extraido = docx2txt.process(temp_path)
 
-        # ------------------------------------------------------------
-        # PDF (em blocos de páginas)
-        # ------------------------------------------------------------
+        # ============================================================
+        # 📘 PDF
+        # ============================================================
         elif mime == "application/pdf":
+            from PyPDF2 import PdfReader
             with open(temp_path, "rb") as f:
                 reader = PdfReader(f)
                 total_paginas = len(reader.pages)
@@ -346,35 +387,35 @@ def ler_arquivo(file_id: str, range_inicio: int = 1, range_fim: int = 15):
                 for i, page in enumerate(reader.pages, start=1):
                     texto = page.extract_text() or ""
                     blocos.append(texto)
-                    # Interrompe e envia resultado parcial se exceder o limite
                     if len("".join(blocos)) > MAX_PAYLOAD:
                         break
                 texto_extraido = "\n".join(blocos)
 
-        # ------------------------------------------------------------
-        # TXT (stream de leitura incremental)
-        # ------------------------------------------------------------
-        elif "text" in mime:
+        # ============================================================
+        # 📄 TXT (leitura incremental)
+        # ============================================================
+        elif "text" in mime or mime == "application/octet-stream":
             with open(temp_path, "r", encoding="utf-8", errors="ignore") as f:
                 partes = []
-                for chunk in read_in_chunks(f, 8192):
+                for chunk in iter(lambda: f.read(8192), ""):
                     partes.append(chunk)
                     if sum(len(p) for p in partes) > MAX_PAYLOAD:
                         break
                 texto_extraido = "".join(partes)
 
-        # ------------------------------------------------------------
-        # PPTX (leitura parcial em slides)
-        # ------------------------------------------------------------
+        # ============================================================
+        # 🖼️ PPTX (PowerPoint ou Google Slides)
+        # ============================================================
         elif mime in [
             "application/vnd.openxmlformats-officedocument.presentationml.presentation",
-            "application/vnd.ms-powerpoint"
+            "application/vnd.ms-powerpoint",
+            "application/vnd.google-apps.presentation"
         ]:
+            from pptx import Presentation
             prs = Presentation(temp_path)
             total_slides = len(prs.slides)
             range_inicio = max(1, min(range_inicio, total_slides))
             range_fim = max(range_inicio, min(range_fim, total_slides))
-
             slides_texto = []
             for i in range(range_inicio, range_fim + 1):
                 slide = prs.slides[i - 1]
@@ -387,12 +428,17 @@ def ler_arquivo(file_id: str, range_inicio: int = 1, range_fim: int = 15):
                     break
             texto_extraido = "\n".join(slides_texto)
 
+        # ============================================================
+        # ❌ Tipo não suportado
+        # ============================================================
         else:
             texto_extraido = f"O tipo de arquivo {mime} não é suportado para leitura direta."
 
         os.remove(temp_path)
 
-        # Sanitização final
+        # ============================================================
+        # 🧹 Sanitização final e truncamento
+        # ============================================================
         texto_extraido = re.sub(r"[\u0000-\u001F\u007F-\u009F]", " ", texto_extraido)
         texto_extraido = re.sub(r"\s{2,}", " ", texto_extraido).strip()
 
@@ -409,29 +455,30 @@ def ler_arquivo(file_id: str, range_inicio: int = 1, range_fim: int = 15):
             "conteudo": texto_extraido
         }
 
+    except HTTPException:
+        raise
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Erro ao ler arquivo: {e}")
 
 
 @app.get("/files/{file_id}/stream")
 def stream_arquivo(file_id: str):
-    """Retorna o conteúdo do arquivo em streaming incremental."""
-    def iterar():
-        service = get_service()
-        file = service.files().get(fileId=file_id, fields="name, mimeType").execute()
-        nome = file["name"]
-        request = service.files().get_media(fileId=file_id)
-        with tempfile.NamedTemporaryFile(delete=False, suffix=os.path.splitext(nome)[-1]) as tmp:
-            downloader = MediaIoBaseDownload(tmp, request)
-            done = False
-            while not done:
-                status, done = downloader.next_chunk()
-                if status:
-                    print(f"Baixando {int(status.progress() * 100)}%...")
-            tmp.seek(0)
-            for chunk in read_in_chunks(tmp, 8192):
-                yield chunk
-    return StreamingResponse(iterar(), media_type="text/plain")
+    """
+    Retorna conteúdo textual processado em stream (chunked),
+    para leitura progressiva de grandes arquivos.
+    """
+    resultado = ler_arquivo(file_id)
+    conteudo = resultado.get("conteudo", "")
+
+    def texto_em_chunks(tamanho=4096):
+        for i in range(0, len(conteudo), tamanho):
+            yield conteudo[i:i+tamanho]
+
+    return StreamingResponse(
+        texto_em_chunks(),
+        media_type="text/plain; charset=utf-8",
+        headers={"Content-Disposition": f"inline; filename={resultado['nome']}.txt"}
+    )
 
 
 @app.get("/files")
