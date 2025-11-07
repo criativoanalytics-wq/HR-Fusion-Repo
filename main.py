@@ -10,6 +10,8 @@ import docx2txt
 from PyPDF2 import PdfReader
 import re
 import spacy
+import json
+from datetime import datetime
 
 # ============================================================
 # 🚀 AIDA DRIVE CONNECTOR - RAG VERSION (Multilíngue e Smart)
@@ -481,7 +483,64 @@ def ler_arquivo(file_id: str, range_inicio: int = 1, range_fim: int = 15):
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Erro ao ler arquivo: {e}")
 
+@app.get("/index_drive")
+def indexar_drive(pasta_raiz: str = None):
+    """
+    🔄 Indexa todo o conteúdo do Google Drive (recursivamente).
+    - Lista todas as pastas e arquivos com paginação.
+    - Armazena metadados em drive_index.json para uso rápido.
+    """
+    try:
+        service = get_service()
+        arquivos_indexados = []
+        pastas_a_visitar = [pasta_raiz] if pasta_raiz else [ "root" ]
 
+        def listar_conteudo(pasta_id, caminho_atual=""):
+            page_token = None
+            while True:
+                results = service.files().list(
+                    q=f"'{pasta_id}' in parents and trashed=false",
+                    fields="nextPageToken, files(id, name, mimeType, modifiedTime, parents)",
+                    pageSize=100,
+                    pageToken=page_token
+                ).execute()
+
+                for item in results.get("files", []):
+                    caminho = f"{caminho_atual}/{item['name']}".strip("/")
+                    item["path"] = caminho
+                    arquivos_indexados.append(item)
+
+                    # Se for pasta → adiciona à fila
+                    if item["mimeType"] == "application/vnd.google-apps.folder":
+                        listar_conteudo(item["id"], caminho)
+
+                page_token = results.get("nextPageToken")
+                if not page_token:
+                    break
+
+        # 🔁 Inicia varredura
+        for pasta_id in pastas_a_visitar:
+            listar_conteudo(pasta_id)
+
+        # 📦 Cria diretório local para índice
+        os.makedirs("index_cache", exist_ok=True)
+        index_path = f"index_cache/drive_index.json"
+
+        with open(index_path, "w", encoding="utf-8") as f:
+            json.dump({
+                "timestamp": datetime.utcnow().isoformat(),
+                "total_itens": len(arquivos_indexados),
+                "arquivos": arquivos_indexados
+            }, f, ensure_ascii=False, indent=2)
+
+        return {
+            "status": "✅ Indexação concluída com sucesso",
+            "total_arquivos": len(arquivos_indexados),
+            "index_path": index_path
+        }
+
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Erro ao indexar o Drive: {e}")
 # ============================================================
 # 🔍 Endpoint raiz
 # ============================================================
