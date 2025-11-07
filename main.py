@@ -4,14 +4,17 @@ from google.oauth2.credentials import Credentials
 from googleapiclient.discovery import build
 from googleapiclient.http import MediaIoBaseDownload
 from io import BytesIO
-import os
 import tempfile
 import docx2txt
 from PyPDF2 import PdfReader
-import re
 import spacy
-import json
 from datetime import datetime
+import tempfile as tmp
+import os, re, json
+import numpy as np
+from sentence_transformers import SentenceTransformer
+import faiss
+import docx
 
 # ============================================================
 # 🚀 AIDA DRIVE CONNECTOR - RAG VERSION (Multilíngue e Smart)
@@ -237,6 +240,65 @@ def smart_read(file_id: str, query: str):
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Erro ao executar smart_read: {e}")
 
+@app.get("/search_transcripts")
+def search_transcripts(query: str, top_k: int = 5):
+    """
+    Busca semântica dentro dos transcripts previamente indexados (FAISS + Sentence Transformers).
+    Retorna os trechos mais relevantes encontrados no índice local.
+    """
+    import os, json
+    import numpy as np
+    import faiss
+    from sentence_transformers import SentenceTransformer
+
+    try:
+        index_path = "index_cache/transcripts.index"
+        meta_path = "index_cache/transcripts_meta.json"
+
+        # 🔹 Verifica se o índice existe
+        if not os.path.exists(index_path) or not os.path.exists(meta_path):
+            raise HTTPException(
+                status_code=404,
+                detail="O índice FAISS ainda não foi criado. Execute /index_transcripts primeiro."
+            )
+
+        # 🔹 Carrega modelo e índice
+        model = SentenceTransformer("paraphrase-multilingual-MiniLM-L12-v2")
+        index = faiss.read_index(index_path)
+
+        with open(meta_path, "r", encoding="utf-8") as f:
+            metadados = json.load(f)
+
+        # 🔹 Gera embedding da query
+        query_embedding = model.encode([query])
+        query_embedding = np.array(query_embedding, dtype=np.float32)
+
+        # 🔹 Realiza busca
+        distances, indices = index.search(query_embedding, top_k)
+        resultados = []
+        for idx, dist in zip(indices[0], distances[0]):
+            if idx < len(metadados):
+                item = metadados[idx]
+                resultados.append({
+                    "arquivo": item["arquivo"],
+                    "file_id": item["file_id"],
+                    "trecho": item["trecho"],
+                    "similaridade": float(1 - dist / 2)  # escala ~0-1
+                })
+
+        if not resultados:
+            return {"mensagem": "Nenhum trecho relevante encontrado para essa busca."}
+
+        return {
+            "query": query,
+            "total_resultados": len(resultados),
+            "resultados": resultados
+        }
+
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Erro ao buscar no índice de transcripts: {e}")
+
+
 @app.get("/smart_search")
 def smart_search(query: str):
     """
@@ -309,7 +371,8 @@ def smart_search(query: str):
 def ler_arquivo(file_id: str, range_inicio: int = 1, range_fim: int = 15):
     """
     Faz download e extrai texto de arquivos (.docx, .pdf, .txt, .pptx),
-    com suporte a leitura paginada e tolerância a falhas.
+    com suporte a leitura paginada, chunking para textos longos e tolerância a falhas.
+    Ideal para leitura de transcripts e apresentações extensas.
     """
     import tempfile as tmp
     import re, os
@@ -331,14 +394,46 @@ def ler_arquivo(file_id: str, range_inicio: int = 1, range_fim: int = 15):
         texto_extraido = ""
 
         # --------------------------------------------------------
-        # 🧩 DOCX
+        # 🧩 DOCX (com chunking inteligente)
         # --------------------------------------------------------
         if mime == "application/vnd.openxmlformats-officedocument.wordprocessingml.document":
+            import docx
+
             try:
                 with tmp.NamedTemporaryFile(delete=False, suffix=".docx") as temp_file:
                     temp_file.write(fh.read())
                     temp_path = temp_file.name
-                texto_extraido = docx2txt.process(temp_path)
+
+                doc = docx.Document(temp_path)
+
+                # 🔹 Extrai todos os parágrafos legíveis
+                paragraphs = [p.text.strip() for p in doc.paragraphs if p.text.strip()]
+                if not paragraphs:
+                    texto_extraido = "⚠️ O arquivo DOCX foi encontrado, mas não contém texto legível."
+                else:
+                    # 🔹 Junta parágrafos e aplica chunking
+                    chunk_size = 5000  # caracteres por bloco
+                    chunks = []
+                    buffer = ""
+                    for paragraph in paragraphs:
+                        if len(buffer) + len(paragraph) < chunk_size:
+                            buffer += paragraph + "\n"
+                        else:
+                            chunks.append(buffer.strip())
+                            buffer = paragraph + "\n"
+                    if buffer:
+                        chunks.append(buffer.strip())
+
+                    texto_extraido = "\n".join(chunks[:10])  # limite leve (~50k caracteres)
+
+                    return {
+                        "nome": nome,
+                        "tipo": mime,
+                        "total_chunks": len(chunks),
+                        "tamanho_medio": int(sum(len(c) for c in chunks) / max(1, len(chunks))),
+                        "conteudo": chunks[:10]  # primeiros 10 blocos
+                    }
+
             finally:
                 if os.path.exists(temp_path):
                     os.remove(temp_path)
@@ -482,6 +577,169 @@ def ler_arquivo(file_id: str, range_inicio: int = 1, range_fim: int = 15):
 
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Erro ao ler arquivo: {e}")
+
+@app.get("/index_transcripts")
+def indexar_transcripts(pasta_raiz: str = None):
+    """
+    Indexa automaticamente todos os transcripts (.docx e Google Docs) do Google Drive.
+    - Inclui arquivos com nomes como 'transcript', 'meeting', 'reunião', 'minutes', 'notes', etc.
+    - Caso nenhum arquivo com essas palavras seja encontrado, indexa todos os .docx da pasta.
+    - Cria índice FAISS com embeddings (Sentence Transformers) para busca semântica posterior.
+    """
+
+    import time
+    inicio = time.time()
+
+    try:
+        service = get_service()
+        model = SentenceTransformer("paraphrase-multilingual-MiniLM-L12-v2")
+
+        print("🚀 Iniciando indexação de transcripts...")
+
+        termos_reuniao = ["transcript", "meeting", "reunião", "minutes", "call", "discussion", "notes"]
+        q_filter = " or ".join([f"name contains '{t}'" for t in termos_reuniao])
+        q = f"({q_filter}) and trashed=false"
+
+        if pasta_raiz:
+            q += f" and '{pasta_raiz}' in parents"
+
+        # 🔍 Busca inicial (termos de reunião)
+        results = service.files().list(
+            q=q,
+            fields="files(id, name, mimeType, modifiedTime)",
+            pageSize=1000
+        ).execute()
+
+        arquivos = results.get("files", [])
+        if not arquivos:
+            print("⚠️ Nenhum transcript com palavras-chave encontrado. Tentando indexar todos os .docx da pasta...")
+            q = f"mimeType='application/vnd.openxmlformats-officedocument.wordprocessingml.document' and trashed=false"
+            if pasta_raiz:
+                q += f" and '{pasta_raiz}' in parents"
+
+            results = service.files().list(
+                q=q,
+                fields="files(id, name, mimeType, modifiedTime)",
+                pageSize=1000
+            ).execute()
+            arquivos = results.get("files", [])
+
+        if not arquivos:
+            print("❌ Nenhum arquivo .docx encontrado para indexar.")
+            return {"status": "⚠️ Nenhum transcript .docx ou Google Docs encontrado."}
+
+        os.makedirs("index_cache", exist_ok=True)
+        embeddings_list, metadados = [], []
+
+        total = len(arquivos)
+        print(f"📁 {total} arquivos candidatos encontrados.")
+
+        for idx, f in enumerate(arquivos, 1):
+            nome = f["name"]
+            mime = f["mimeType"]
+            file_id = f["id"]
+            print(f"\n[{idx}/{total}] 📄 Processando: {nome}")
+
+            try:
+                # 🔸 Download ou exportação
+                if mime == "application/vnd.google-apps.document":
+                    request = service.files().export_media(
+                        fileId=file_id,
+                        mimeType="application/vnd.openxmlformats-officedocument.wordprocessingml.document"
+                    )
+                elif mime == "application/vnd.openxmlformats-officedocument.wordprocessingml.document":
+                    request = service.files().get_media(fileId=file_id)
+                else:
+                    print(f"⏭️ Tipo ignorado: {mime}")
+                    continue
+
+                fh = BytesIO()
+                downloader = MediaIoBaseDownload(fh, request)
+                done = False
+                while not done:
+                    status, done = downloader.next_chunk()
+                fh.seek(0)
+
+                with tmp.NamedTemporaryFile(delete=False, suffix=".docx") as temp_file:
+                    temp_file.write(fh.read())
+                    temp_path = temp_file.name
+
+                # 🔹 Leitura do documento
+                doc = docx.Document(temp_path)
+                os.remove(temp_path)
+
+                paragraphs = [p.text.strip() for p in doc.paragraphs if p.text.strip()]
+                if not paragraphs:
+                    print("⚠️ Documento vazio, ignorado.")
+                    continue
+
+                # 🔹 Chunking (divisão por blocos de texto)
+                chunk_size = 5000
+                buffer = ""
+                chunks_arquivo = 0
+
+                for paragraph in paragraphs:
+                    if len(buffer) + len(paragraph) < chunk_size:
+                        buffer += paragraph + "\n"
+                    else:
+                        emb = model.encode(buffer)
+                        embeddings_list.append(emb)
+                        metadados.append({
+                            "arquivo": nome,
+                            "file_id": file_id,
+                            "trecho": buffer[:300] + "..."
+                        })
+                        chunks_arquivo += 1
+                        buffer = paragraph + "\n"
+
+                if buffer:
+                    emb = model.encode(buffer)
+                    embeddings_list.append(emb)
+                    metadados.append({
+                        "arquivo": nome,
+                        "file_id": file_id,
+                        "trecho": buffer[:300] + "..."
+                    })
+                    chunks_arquivo += 1
+
+                print(f"✅ {chunks_arquivo} trechos indexados de {nome}")
+
+            except Exception as e:
+                print(f"⚠️ Erro ao processar {nome}: {e}")
+                continue
+
+        if not embeddings_list:
+            print("❌ Nenhum trecho válido encontrado para indexação.")
+            return {"status": "Nenhum trecho válido encontrado para indexação."}
+
+        # 🔹 Criação do índice FAISS
+        embeddings = np.array(embeddings_list, dtype=np.float32)
+        index = faiss.IndexFlatL2(embeddings.shape[1])
+        index.add(embeddings)
+
+        index_path = "index_cache/transcripts.index"
+        meta_path = "index_cache/transcripts_meta.json"
+
+        faiss.write_index(index, index_path)
+        with open(meta_path, "w", encoding="utf-8") as f:
+            json.dump(metadados, f, ensure_ascii=False, indent=2)
+
+        tempo = round(time.time() - inicio, 2)
+        print(f"\n🏁 Indexação concluída em {tempo}s.")
+        print(f"📊 Arquivos: {len(arquivos)} | Trechos: {len(embeddings_list)}")
+
+        return {
+            "status": "✅ Indexação concluída com sucesso.",
+            "total_arquivos": len(arquivos),
+            "total_chunks": len(embeddings_list),
+            "index_path": index_path,
+            "meta_path": meta_path,
+            "tempo_execucao_seg": tempo
+        }
+
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Erro ao indexar transcripts: {e}")
+
 
 @app.get("/index_drive")
 def indexar_drive(pasta_raiz: str = None):
