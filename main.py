@@ -149,6 +149,91 @@ def listar_arquivos(pasta_id: str = None, query: str = None):
         raise HTTPException(status_code=500, detail=f"Erro ao listar arquivos: {e}")
 
 
+@app.get("/smart_read")
+def smart_read(file_id: str, query: str):
+    """
+    Busca leve dentro de um PPTX do Google Drive.
+    Retorna apenas os slides que contêm o termo especificado.
+    Ideal para agentes com limite de payload.
+    """
+    try:
+        from pptx import Presentation
+        from io import BytesIO
+        import re, tempfile, os
+
+        if not query:
+            raise HTTPException(status_code=400, detail="Parâmetro 'query' é obrigatório.")
+
+        service = get_service()
+        file = service.files().get(fileId=file_id, fields="name, mimeType").execute()
+        nome = file["name"]
+        mime = file["mimeType"]
+
+        if mime not in [
+            "application/vnd.openxmlformats-officedocument.presentationml.presentation",
+            "application/vnd.ms-powerpoint"
+        ]:
+            raise HTTPException(status_code=400, detail="O arquivo não é um PowerPoint (.pptx).")
+
+        # 📦 Download temporário
+        request = service.files().get_media(fileId=file_id)
+        fh = BytesIO()
+        downloader = MediaIoBaseDownload(fh, request)
+        done = False
+        while not done:
+            status, done = downloader.next_chunk()
+        fh.seek(0)
+
+        with tempfile.NamedTemporaryFile(delete=False, suffix=".pptx") as tmp:
+            tmp.write(fh.read())
+            tmp_path = tmp.name
+
+        prs = Presentation(tmp_path)
+        os.remove(tmp_path)
+
+        slides = []
+        for i, slide in enumerate(prs.slides, start=1):
+            textos = []
+            for shape in slide.shapes:
+                if hasattr(shape, "text") and shape.text.strip():
+                    textos.append(shape.text.strip())
+            full_text = " ".join(textos)
+            full_text = re.sub(r"\s{2,}", " ", full_text).strip()
+
+            titulo = textos[0] if textos else f"Slide {i}"
+            slides.append({
+                "slide_numero": i,
+                "titulo": titulo,
+                "conteudo": full_text
+            })
+
+        # 🔍 Busca simples (case-insensitive)
+        query_regex = re.compile(re.escape(query), re.IGNORECASE)
+        resultados = [
+            s for s in slides
+            if query_regex.search(s["conteudo"])
+        ]
+
+        if not resultados:
+            return {
+                "arquivo": nome,
+                "query": query,
+                "total_slides": len(slides),
+                "resultados": [],
+                "mensagem": "Nenhum slide contém o termo buscado."
+            }
+
+        # 🔎 Resumo dos resultados (leve para GPT)
+        return {
+            "arquivo": nome,
+            "query": query,
+            "total_slides": len(slides),
+            "slides_encontrados": len(resultados),
+            "resultados": resultados[:10]  # limite de segurança
+        }
+
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Erro ao executar smart_read: {e}")
 
 @app.get("/smart_search")
 def smart_search(query: str):
@@ -222,8 +307,12 @@ def smart_search(query: str):
 def ler_arquivo(file_id: str, range_inicio: int = 1, range_fim: int = 15):
     """
     Faz download e extrai texto de arquivos (.docx, .pdf, .txt, .pptx),
-    com suporte a leitura paginada para PPTX muito grandes.
+    com suporte a leitura paginada e tolerância a falhas.
     """
+    import tempfile as tmp
+    import re, os
+    from pptx import Presentation
+
     try:
         service = get_service()
         file = service.files().get(fileId=file_id, fields="name, mimeType").execute()
@@ -243,11 +332,14 @@ def ler_arquivo(file_id: str, range_inicio: int = 1, range_fim: int = 15):
         # 🧩 DOCX
         # --------------------------------------------------------
         if mime == "application/vnd.openxmlformats-officedocument.wordprocessingml.document":
-            with tempfile.NamedTemporaryFile(delete=False, suffix=".docx") as temp_file:
-                temp_file.write(fh.read())
-                temp_path = temp_file.name
-            texto_extraido = docx2txt.process(temp_path)
-            os.remove(temp_path)
+            try:
+                with tmp.NamedTemporaryFile(delete=False, suffix=".docx") as temp_file:
+                    temp_file.write(fh.read())
+                    temp_path = temp_file.name
+                texto_extraido = docx2txt.process(temp_path)
+            finally:
+                if os.path.exists(temp_path):
+                    os.remove(temp_path)
 
         # --------------------------------------------------------
         # 📘 PDF
@@ -263,145 +355,113 @@ def ler_arquivo(file_id: str, range_inicio: int = 1, range_fim: int = 15):
             texto_extraido = fh.read().decode("utf-8", errors="ignore")
 
         # --------------------------------------------------------
-        # 🖼️ PPTX (PowerPoint) — leitura hierárquica e agrupamento por faixas visuais (com paginação segura)
+        # 🖼️ PPTX (PowerPoint) — leitura hierárquica com paginação
         # --------------------------------------------------------
         elif mime in [
             "application/vnd.openxmlformats-officedocument.presentationml.presentation",
             "application/vnd.ms-powerpoint"
         ]:
-            from pptx import Presentation
-            import re, tempfile, os
+            try:
+                with tmp.NamedTemporaryFile(delete=False, suffix=".pptx") as temp_file:
+                    temp_file.write(fh.read())
+                    temp_path = temp_file.name
 
-            with tempfile.NamedTemporaryFile(delete=False, suffix=".pptx") as temp_file:
-                temp_file.write(fh.read())
-                temp_path = temp_file.name
+                prs = Presentation(temp_path)
+                total_slides = len(prs.slides)
+                range_inicio = max(1, min(range_inicio, total_slides))
+                range_fim = max(range_inicio, min(range_fim, total_slides))
 
-            prs = Presentation(temp_path)
-            total_slides = len(prs.slides)
+                slides_estruturados = []
 
-            # 🔹 Garante que os índices estejam dentro dos limites
-            range_inicio = max(1, min(range_inicio, total_slides))
-            range_fim = max(range_inicio, min(range_fim, total_slides))
+                def extrair_texto_recursivo(shape, elementos):
+                    if hasattr(shape, "text") and shape.text.strip():
+                        elementos.append({
+                            "texto": shape.text.strip(),
+                            "x": int(getattr(shape, "left", 0)),
+                            "y": int(getattr(shape, "top", 0))
+                        })
+                    if hasattr(shape, "shapes"):
+                        for subshape in shape.shapes:
+                            extrair_texto_recursivo(subshape, elementos)
+                    if hasattr(shape, "has_table") and shape.has_table:
+                        table = shape.table
+                        for row in table.rows:
+                            row_text = " | ".join(
+                                cell.text.strip() for cell in row.cells if cell.text.strip()
+                            )
+                            if row_text:
+                                elementos.append({
+                                    "texto": row_text,
+                                    "x": int(getattr(shape, "left", 0)),
+                                    "y": int(getattr(shape, "top", 0))
+                                })
 
-            slides_estruturados = []
+                for i in range(range_inicio, range_fim + 1):
+                    slide = prs.slides[i - 1]
+                    elementos = []
+                    for shape in slide.shapes:
+                        extrair_texto_recursivo(shape, elementos)
 
-            def extrair_texto_recursivo(shape, elementos):
-                """Extrai texto e posição de shapes, incluindo grupos e tabelas."""
-                # 🔹 Texto simples
-                if hasattr(shape, "text") and shape.text.strip():
-                    elementos.append({
-                        "texto": shape.text.strip(),
-                        "x": int(getattr(shape, "left", 0)),
-                        "y": int(getattr(shape, "top", 0)),
-                        "largura": int(getattr(shape, "width", 0)),
-                        "altura": int(getattr(shape, "height", 0)),
+                    elementos_ordenados = sorted(elementos, key=lambda e: (e["y"], e["x"]))
+                    linha_id, ultima_y = 0, None
+                    for el in elementos_ordenados:
+                        if ultima_y is None or abs(el["y"] - ultima_y) > 200000:
+                            linha_id += 1
+                            ultima_y = el["y"]
+                        el["linha_visual"] = linha_id
+
+                    faixas = {}
+                    for e in elementos_ordenados:
+                        faixa_id = e["linha_visual"]
+                        faixas.setdefault(faixa_id, []).append(e["texto"])
+                    faixas_agrupadas = [
+                        {"linha_visual": k, "conteudo": " ".join(v)} for k, v in faixas.items()
+                    ]
+
+                    notas = ""
+                    if slide.has_notes_slide and slide.notes_slide.notes_text_frame:
+                        notas = slide.notes_slide.notes_text_frame.text.strip()
+
+                    titulo_slide = next(
+                        (e["texto"] for e in elementos_ordenados if e["linha_visual"] == 1),
+                        f"Slide {i}"
+                    )
+
+                    slides_estruturados.append({
+                        "slide_numero": i,
+                        "titulo": titulo_slide,
+                        "faixas": faixas_agrupadas,
+                        "notas": notas
                     })
 
-                # 🔹 Subshapes (grupos)
-                if hasattr(shape, "shapes"):
-                    for subshape in shape.shapes:
-                        extrair_texto_recursivo(subshape, elementos)
+                texto_extraido = ""
+                for s in slides_estruturados:
+                    texto_extraido += f"\n\n=== SLIDE {s['slide_numero']} - {s['titulo']} ===\n"
+                    for f in s["faixas"]:
+                        texto_extraido += f"[Faixa {f['linha_visual']}] {f['conteudo']}\n"
 
-                # 🔹 Tabelas
-                if hasattr(shape, "has_table") and shape.has_table:
-                    table = shape.table
-                    for row in table.rows:
-                        row_text = " | ".join(cell.text.strip() for cell in row.cells if cell.text.strip())
-                        if row_text:
-                            elementos.append({
-                                "texto": row_text,
-                                "x": int(getattr(shape, "left", 0)),
-                                "y": int(getattr(shape, "top", 0)),
-                                "largura": int(getattr(shape, "width", 0)),
-                                "altura": int(getattr(shape, "height", 0)),
-                            })
+                texto_extraido = (
+                    texto_extraido.replace("\\n", "\n")
+                    .replace("\r", "\n")
+                    .replace("\t", " ")
+                )
+                texto_extraido = re.sub(r"[\u0000-\u001F\u007F-\u009F]", " ", texto_extraido)
+                texto_extraido = re.sub(r"\u00A0", " ", texto_extraido)
+                texto_extraido = re.sub(r"\s{2,}", " ", texto_extraido)
+                texto_extraido = re.sub(r"\n{2,}", "\n", texto_extraido).strip()
 
-            # ========================================================
-            # 🔹 Loop principal dos slides no intervalo solicitado
-            # ========================================================
-            for i in range(range_inicio, range_fim + 1):
-                slide = prs.slides[i - 1]
-                elementos = []
+            finally:
+                if os.path.exists(temp_path):
+                    os.remove(temp_path)
 
-                for shape in slide.shapes:
-                    extrair_texto_recursivo(shape, elementos)
-
-                # Ordena shapes (topo → baixo, esquerda → direita)
-                elementos_ordenados = sorted(elementos, key=lambda e: (e["y"], e["x"]))
-
-                # Agrupa por faixa horizontal
-                linha_id = 0
-                ultima_y = None
-                for el in elementos_ordenados:
-                    if ultima_y is None or abs(el["y"] - ultima_y) > 200000:
-                        linha_id += 1
-                        ultima_y = el["y"]
-                    el["linha_visual"] = linha_id
-
-                # Notas do apresentador
-                notas = None
-                if slide.has_notes_slide and slide.notes_slide.notes_text_frame:
-                    notas = slide.notes_slide.notes_text_frame.text.strip()
-
-                # Título
-                titulo_slide = next((e["texto"] for e in elementos_ordenados if e["linha_visual"] == 1), f"Slide {i}")
-
-                # Agrupa conteúdo por faixa visual
-                faixas = {}
-                for e in elementos_ordenados:
-                    faixa_id = e["linha_visual"]
-                    faixas.setdefault(faixa_id, []).append(e["texto"])
-
-                faixas_agrupadas = [
-                    {"linha_visual": k, "conteudo": " ".join(v)} for k, v in faixas.items()
-                ]
-
-                slides_estruturados.append({
-                    "slide_numero": i,
-                    "titulo": titulo_slide,
-                    #"elementos": elementos_ordenados,
-                    "faixas": faixas_agrupadas,
-                    "notas": notas or ""
-                })
-
-            # ========================================================
-            # 🔹 Monta o texto legível consolidado
-            # ========================================================
-            texto_extraido = ""
-            for s in slides_estruturados:
-                texto_extraido += f"\n\n=== SLIDE {s['slide_numero']} - {s['titulo']} ===\n"
-                for f in s["faixas"]:
-                    texto_extraido += f"[Faixa {f['linha_visual']}] {f['conteudo']}\n"
-
-            # ========================================================
-            # 🧹 Limpeza e normalização profunda
-            # ========================================================
-            texto_extraido = (
-                texto_extraido
-                .replace("\\n", "\n")
-                .replace("\r", "\n")
-                .replace("\t", " ")
-            )
-            texto_extraido = re.sub(r"[\u0000-\u001F\u007F-\u009F]", " ", texto_extraido)
-            texto_extraido = re.sub(r"\u00A0", " ", texto_extraido)
-            texto_extraido = re.sub(r"\s{2,}", " ", texto_extraido)
-            texto_extraido = re.sub(r"\n{2,}", "\n", texto_extraido).strip()
-
-            os.remove(temp_path)
-
-            # ========================================================
-            # ✅ Retorno final híbrido (legível + estruturado)
-            # ========================================================
             return {
                 "nome": nome,
                 "tipo": mime,
                 "intervalo_lido": f"{range_inicio}-{range_fim}",
                 "total_slides": total_slides,
-                #"conteudo": texto_extraido[:80000],
+                "conteudo": texto_extraido[:80000],
                 "conteudo_estruturado": slides_estruturados
             }
-
-
 
         # --------------------------------------------------------
         # ❗ Outros formatos
@@ -409,17 +469,18 @@ def ler_arquivo(file_id: str, range_inicio: int = 1, range_fim: int = 15):
         else:
             texto_extraido = f"O tipo de arquivo {mime} não é suportado para leitura direta."
 
-        if not texto_extraido.strip():
+        if not isinstance(texto_extraido, str) or not texto_extraido.strip():
             texto_extraido = "⚠️ O arquivo foi encontrado, mas parece não conter texto legível."
 
         return {
             "nome": nome,
             "tipo": mime,
-            "conteudo": texto_extraido[:50000]  # Limite de segurança
+            "conteudo": texto_extraido[:50000]
         }
 
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Erro ao ler arquivo: {e}")
+
 
 # ============================================================
 # 🔍 Endpoint raiz
